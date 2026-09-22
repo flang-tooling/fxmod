@@ -1,0 +1,24 @@
+function(fxmod_add_test name)
+  add_executable(${name} ${name}.cpp)
+  target_link_libraries(${name} PRIVATE fxmod::fxmod ZLIB::ZLIB)
+  target_link_options(${name} PRIVATE ${FXMOD_PORTABLE_LINK_OPTIONS})
+  target_include_directories(${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_compile_definitions(${name} PRIVATE
+    FXMOD_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
+  add_test(NAME ${name} COMMAND ${name})
+  set_tests_properties(${name} PROPERTIES SKIP_RETURN_CODE 125)
+endfunction()
+
+fxmod_add_test(test_sexpr)
+fxmod_add_test(test_gfortran_parse)
+fxmod_add_test(test_gfortran_emit)
+fxmod_add_test(test_emit_best_effort)
+fxmod_add_test(test_version_gate)
+fxmod_add_test(test_flang_module)
+fxmod_add_test(test_ifx_module)
+fxmod_add_test(test_ifx_emit)
+
+fxmod_add_test(test_wrap)
+target_compile_definitions(test_wrap PRIVATE
+  FXMOD_CLI_EXE="$<TARGET_FILE:fxmod-cli>")
+add_dependencies(test_wrap fxmod-cli)
