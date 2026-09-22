@@ -1,0 +1,80 @@
+
+MODULE HEADER
+major_id: 13
+minor_id: 1
+map_start_pos: 600
+num_of_entities: 5
+target_arch: _EFI2_LINUX 11
+compiler_edit: 1156
+gemver: 
+compiler_ver: 26.0
+time_of_creation: Fri Aug 21 12:23:15 2026
+submodule: not allowed
+
+
+ MODULE BODY
+
+
+ Entity # 1 ----- fn#fn
+   entity kind: file_name
+ (0)decl_rec_kind:10
+ (8)flags:
+  (0)specifics for:file_name
+ (8)file_name:mymod.f90
+ (18)module_name:MYMOD
+
+ Entity # 2 ----- ANSWER
+   entity kind: simple_scalar
+ (0)decl_rec_kind:13
+ (8)flags:
+   EXPL_TYPE
+ (56)sym_id:1
+ (62)class:LOCAL
+ (63)skind:PARAM
+   (0)specifics for:simple_scalar
+ (64)stype:INT4
+ (72)intval:42
+
+ Entity # 3 ----- PI_APPROX
+   entity kind: simple_scalar
+ (0)decl_rec_kind:13
+ (8)flags:
+   EXPL_TYPE
+ (56)sym_id:2
+ (62)class:LOCAL
+ (63)skind:PARAM
+   (0)specifics for:simple_scalar
+ (64)stype:REAL4
+ (72)realval: 3.141590e+00
+
+ Entity # 4 ----- ADD_ANSWER
+   entity kind: func_ret_simple_scalar
+ (0)decl_rec_kind:37
+ (8)flags:
+   EXPLICIT
+   HAS_RESULT
+   EXPL_TYPE
+   FUNC_TYPE
+   MODULE_PROC
+   TYPED_ON_FUNC_SUBP
+ (56)sym_id:3
+ (62)class:LOCAL
+ (63)skind:MFUNC
+  (0)specifics for:func_ret_simple_scalar
+ (80)type:INT4
+ (76)arguments:
+   X, sym_id: 4
+
+ Entity # 5 ----- ADD_ANSWER%X
+   entity kind: simple_scalar_arg
+ (0)decl_rec_kind:28
+ (8)flags:
+   IN
+   INTENT
+   EXPL_TYPE
+ (56)sym_id:4
+ (62)class:DUMMY
+ (63)skind:SCALAR
+  (0)specifics for:simple_scalar_arg
+ (64)type:INT4
+ (65)passed by:value

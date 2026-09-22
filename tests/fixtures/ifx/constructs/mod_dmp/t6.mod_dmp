@@ -1,0 +1,81 @@
+
+MODULE HEADER
+major_id: 13
+minor_id: 1
+map_start_pos: 523
+num_of_entities: 5
+target_arch: _EFI2_LINUX 11
+compiler_edit: 1156
+gemver: 
+compiler_ver: 26.0
+time_of_creation: Fri Sep 11 09:53:42 2026
+submodule: not allowed
+
+
+ MODULE BODY
+
+
+ Entity # 1 ----- fn#fn
+   entity kind: file_name
+ (0)decl_rec_kind:10
+ (8)flags:
+  (0)specifics for:file_name
+ (8)file_name:t6.f90
+ (15)module_name:T6
+
+ Entity # 2 ----- POINT
+   entity kind: derived_type
+ (0)decl_rec_kind:11
+ (8)flags:
+   TYPE90
+ (56)sym_id:1
+ (62)class:LOCAL
+ (63)skind:TYPE
+  (0)specifics for:derived_type
+ (64)width:8
+ (72)largest_el:4
+ (82)align:natural
+ (85)howsequenced:none
+ field_names:
+   (88)X, sym_id: 2
+   (95)Y, sym_id: 3
+
+ Entity # 3 ----- POINT%X
+   entity kind: simple_scalar_field
+ (0)decl_rec_kind:23
+ (8)flags:
+   EXPL_TYPE
+   FIELD
+   FIELD90
+ (56)sym_id:2
+ (62)class:LOCAL
+ (63)skind:FIELD
+  (0)specifics for:simple_scalar_field
+ (64)offset:0
+ (76)type:REAL4
+
+ Entity # 4 ----- POINT%Y
+   entity kind: simple_scalar_field
+ (0)decl_rec_kind:23
+ (8)flags:
+   EXPL_TYPE
+   FIELD
+   FIELD90
+ (56)sym_id:3
+ (62)class:LOCAL
+ (63)skind:FIELD
+  (0)specifics for:simple_scalar_field
+ (64)offset:4
+ (76)type:REAL4
+
+ Entity # 5 ----- P
+   entity kind: struct
+ (0)decl_rec_kind:14
+ (8)flags:
+   EXPL_TYPE
+ (56)sym_id:4
+ (62)class:LOCAL
+ (63)skind:SCALAR
+  (0)specifics for:struct
+ nbytes:8
+ (72)type_name:POINT, sym_id: 1

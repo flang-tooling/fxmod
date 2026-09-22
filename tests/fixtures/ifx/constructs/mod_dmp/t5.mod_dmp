@@ -1,0 +1,54 @@
+
+MODULE HEADER
+major_id: 13
+minor_id: 1
+map_start_pos: 337
+num_of_entities: 3
+target_arch: _EFI2_LINUX 11
+compiler_edit: 1156
+gemver: 
+compiler_ver: 26.0
+time_of_creation: Fri Sep 11 09:53:42 2026
+submodule: not allowed
+
+
+ MODULE BODY
+
+
+ Entity # 1 ----- fn#fn
+   entity kind: file_name
+ (0)decl_rec_kind:10
+ (8)flags:
+  (0)specifics for:file_name
+ (8)file_name:t5.f90
+ (15)module_name:T5
+
+ Entity # 2 ----- BUMP
+   entity kind: subr
+ (0)decl_rec_kind:35
+ (8)flags:
+   EXPLICIT
+   FUNC_TYPE
+   MODULE_PROC
+ (56)sym_id:1
+ (62)class:LOCAL
+ (63)skind:MSUBR
+  (0)specifics for:subr
+ (76)arguments:
+   Y, sym_id: 2
+
+ Entity # 3 ----- BUMP%Y
+   entity kind: simple_scalar_arg
+ (0)decl_rec_kind:28
+ (8)flags:
+   IN
+   INTENT
+   OUT
+   RCVVAL
+   EXPL_TYPE
+ (56)sym_id:2
+ (62)class:DUMMY
+ (63)skind:SCALAR
+  (0)specifics for:simple_scalar_arg
+ (64)type:INT4
+ (65)passed by:reference
