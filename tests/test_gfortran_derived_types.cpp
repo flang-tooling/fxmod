@@ -5,7 +5,8 @@
 // declared private. Types are declared in component order: holder_t needs
 // point_t first, although it sorts before it, and point_t the private
 // coords_t, which is declared although it is not public -- as is a parent
-// type before its extensions.
+// type before its extensions. A generic named like a type -- an
+// overloaded constructor -- keeps its specifics.
 #include <fxmod/module.hpp>
 
 #include "test_util.hpp"
@@ -32,6 +33,7 @@ int main() {
            "type, extends(Shape_t) :: Circle_t",
            "  procedure :: area => circle_area",
            "private :: shape_describe",
+           "interface Point_t",
        })
     if (src.find(line) == std::string::npos) {
       std::fprintf(stderr, "missing '%s' in:\n%s", line, src.c_str());
@@ -51,6 +53,7 @@ int main() {
                          "  class(shape_t), allocatable :: s\n"
                          "  type(holder_t) :: h\n"
                          "  h%p%c%x = 1d0\n"
+                         "  h%p = point_t(1d0)\n"
                          "  allocate(s, source=c)\n"
                          "  call s%info()\n"
                          "  print *, s%area(), c%kind_name(), c%same_id(1)\n"

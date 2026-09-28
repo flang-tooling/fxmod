@@ -1,8 +1,8 @@
 ! Type extension, an abstract type, type-bound procedures of every kind
 ! (deferred, renamed, nopass, pass(name), generic, private), binding targets
-! that are not public, and types whose declaration order matters:
-! holder_t's component is a point_t, which sorts after it, and point_t's
-! is a private type.
+! that are not public, types whose declaration order matters (holder_t's
+! component is a point_t, which sorts after it, and point_t's is a private
+! type), and a constructor overloaded by a generic of the type's name.
 module derived_types
   implicit none
   private
@@ -15,6 +15,9 @@ module derived_types
   type :: point_t
     type(coords_t) :: c
   end type point_t
+  interface point_t
+    module procedure make_point
+  end interface point_t
 
   type :: holder_t
     type(point_t) :: p
@@ -63,4 +66,9 @@ contains
     class(circle_t), intent(in) :: self
     circle_area = 3 * self%r**2
   end function circle_area
+  type(point_t) function make_point(x)
+    real(8), intent(in) :: x
+    make_point%c%x = x
+    make_point%c%y = x
+  end function make_point
 end module derived_types

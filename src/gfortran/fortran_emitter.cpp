@@ -837,9 +837,23 @@ Analysis analyse(const std::map<int, Symbol> &symbols,
   // marked GENERIC (handled above, in symtree order like everything
   // else). Runs after the main pass so any derived types it might
   // reference are already declared.
-  for (const auto &[key, gi] : generics) {
-    if (handled_generic_names.count(key) || derived_by_name.count(key))
+  for (const auto &[key, gi_in] : generics) {
+    if (handled_generic_names.count(key))
       continue;
+    GenericInterface gi = gi_in;
+    if (derived_by_name.count(key)) {
+      // A generic named like a type: gfortran's structure constructor,
+      // listed with the type itself among its specifics, and whatever
+      // functions the source added to it (an overloaded constructor).
+      auto end = std::remove_if(gi.specifics.begin(), gi.specifics.end(), [&](int n) {
+        auto it = symbols.find(n);
+        return it == symbols.end() || it->second.flavor() == "DERIVED";
+      });
+      gi.specifics.erase(end, gi.specifics.end());
+      if (gi.specifics.empty())
+        continue;
+      gi.name = derived_by_name.at(key)->name;
+    }
     if (!gi.module.empty() && lower(gi.module) != lower(current_module)) {
       // A generic USEd from its defining module and passed on.
       record_use(a.uses, gi.module, gi.name, gi.name);
