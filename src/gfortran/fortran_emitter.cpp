@@ -400,6 +400,17 @@ Analysis analyse(const std::map<int, Symbol> &symbols,
     const Symbol &sym = sit->second;
     if (sym.flavor() == "MODULE")
       continue; // a use-associated module, not a declaration of our own
+    if (!sym.module_name.empty() &&
+        lower(sym.module_name) != lower(current_module)) {
+      // Re-exported from the module that defines it (iso_c_binding's
+      // constants and procedures, or a whole module USEd and passed on):
+      // this module's copy is only a reference, so `use` the original
+      // rather than redeclaring it -- a redeclaration would be a distinct
+      // entity, and clash with the original wherever both are visible.
+      record_use(a.uses, sym.module_name, sym.name, public_name);
+      emitted.insert(number);
+      continue;
+    }
 
     if (sym.flavor() == "PARAMETER") {
       if (!sym.typespec.has_value() || !sym.value_node.has_value()) {
@@ -489,6 +500,11 @@ Analysis analyse(const std::map<int, Symbol> &symbols,
   for (const auto &[key, gi] : generics) {
     if (handled_generic_names.count(key) || derived_by_name.count(key))
       continue;
+    if (!gi.module.empty() && lower(gi.module) != lower(current_module)) {
+      // A generic USEd from its defining module and passed on.
+      record_use(a.uses, gi.module, gi.name, gi.name);
+      continue;
+    }
     try {
       std::vector<std::string> lines = emit_generic(
           gi.name, gi, symbols, current_module, a.uses,

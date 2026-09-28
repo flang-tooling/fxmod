@@ -47,11 +47,12 @@ struct ModuleUse {
 };
 using NeededUses = std::map<std::string, ModuleUse>;
 
-// gfortran spells every intrinsic module (ISO_C_BINDING,
-// ISO_FORTRAN_ENV, IEEE_ARITHMETIC, ...) internally with a leading "__"
-// -- a real `use __iso_c_binding` doesn't compile, so that prefix is
-// stripped and the result marked `intrinsic`. Anything else is a plain
-// external module, used exactly as spelled.
+// gfortran spells most intrinsic modules (ISO_C_BINDING, ISO_FORTRAN_ENV,
+// ...) internally with a leading "__" -- a real `use __iso_c_binding`
+// doesn't compile, so that prefix is stripped and the result marked
+// `intrinsic`. The IEEE modules it spells plainly, so those are
+// recognised by name. Anything else is a plain external module, used
+// exactly as spelled.
 struct ResolvedModuleName {
   std::string name;
   bool intrinsic = false;
@@ -198,6 +199,9 @@ std::map<std::string, int> parse_symtree(const Module &module);
 // is_generic() symbol's name as a real user generic.
 struct GenericInterface {
   std::string name; // as spelled in the module, for rendering
+  // The module that defines the generic: a module re-exporting a generic
+  // it USEs lists it here too, under the defining module's name.
+  std::string module;
   std::vector<int> specifics;
 };
 

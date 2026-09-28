@@ -43,6 +43,12 @@ bool same_module(const std::string &a, const std::string &b) {
 ResolvedModuleName resolve_module_name(const std::string &module_name) {
   if (starts_with(module_name, "__"))
     return {module_name.substr(2), true};
+  // The IEEE modules are intrinsic too, but gfortran spells them plainly.
+  static const char *const kPlainIntrinsic[] = {
+      "ieee_arithmetic", "ieee_exceptions", "ieee_features"};
+  for (const char *m : kPlainIntrinsic)
+    if (lower_copy(module_name) == m)
+      return {module_name, true};
   return {module_name, false};
 }
 
@@ -441,6 +447,8 @@ std::map<std::string, GenericInterface> parse_generic_interfaces(const Module &m
       continue;
     GenericInterface gi;
     gi.name = e[0].str();
+    if (e[1].is_str())
+      gi.module = e[1].str();
     for (std::size_t i = 2; i < e.size(); ++i)
       if (e[i].is_int())
         gi.specifics.push_back(static_cast<int>(e[i].integer()));
