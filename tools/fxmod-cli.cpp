@@ -18,10 +18,12 @@
 #include <iostream>
 #include <map>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <vector>
 
+#include <fcntl.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -260,7 +262,8 @@ std::vector<std::string> module_output_flags(fxmod::Family target,
   }
 }
 
-int run_child(const std::vector<std::string> &argv, const std::string &cwd) {
+int run_child(const std::vector<std::string> &argv, const std::string &cwd,
+              bool quiet = false) {
   std::vector<char *> cargv;
   cargv.reserve(argv.size() + 1);
   for (const std::string &a : argv)
@@ -276,6 +279,14 @@ int run_child(const std::vector<std::string> &argv, const std::string &cwd) {
     if (!cwd.empty() && chdir(cwd.c_str()) != 0) {
       std::perror("fxmod-cli: chdir");
       _exit(127);
+    }
+    if (quiet) {
+      int null_fd = open("/dev/null", O_WRONLY);
+      if (null_fd >= 0) {
+        dup2(null_fd, STDOUT_FILENO);
+        dup2(null_fd, STDERR_FILENO);
+        close(null_fd);
+      }
     }
     execvp(cargv[0], cargv.data());
     std::perror(("fxmod-cli: exec " + argv[0]).c_str());
@@ -312,6 +323,28 @@ std::vector<std::string> used_modules(const std::string &source) {
     while (!name.empty() && std::isspace(static_cast<unsigned char>(name.back())))
       name.pop_back();
     out.push_back(lower_copy(name));
+  }
+  return out;
+}
+
+// The intrinsic types among those gfortran modules commonly use that the
+// target compiler lacks (Flang on x86-64 has no real(16), for one), found by
+// compiling a declaration of each: an interface using one could only fail
+// to compile there, and is left out instead (see fxmod::EmitOptions).
+std::vector<std::pair<std::string, int>>
+probe_unsupported_kinds(const std::string &compiler, const fs::path &build) {
+  static const std::pair<const char *, int> kCandidates[] = {
+      {"REAL", 10}, {"REAL", 16}, {"INTEGER", 16}};
+  std::vector<std::pair<std::string, int>> out;
+  for (const auto &[category, kind] : kCandidates) {
+    std::string type = lower_copy(category) + "(" + std::to_string(kind) + ")";
+    fs::path src = build / ("fxmod_probe_" + lower_copy(category) +
+                            std::to_string(kind) + ".f90");
+    std::ofstream(src) << "subroutine fxmod_probe\n  " << type
+                       << " :: x\nend subroutine fxmod_probe\n";
+    if (run_child({compiler, "-fsyntax-only", src.string()}, build.string(),
+                  /*quiet=*/true) != 0)
+      out.emplace_back(category, kind);
   }
   return out;
 }
@@ -417,6 +450,7 @@ int run_wrap(const std::vector<std::string> &args) {
     std::vector<std::string> uses; // lowercased module names
   };
   std::vector<Pending> pending;
+  std::optional<fxmod::EmitOptions> options; // probed on first need
   for (const std::string &dir_str : dirs) {
     fs::path dir(dir_str);
     if (!fs::is_directory(dir))
@@ -448,9 +482,20 @@ int run_wrap(const std::vector<std::string> &args) {
         continue;
       }
 
+      if (!options) {
+        options.emplace();
+        options->strict = !best_effort;
+        options->unsupported_kinds = probe_unsupported_kinds(command[0], build);
+        if (verbose)
+          for (const auto &[category, kind] : options->unsupported_kinds)
+            std::cerr << "fxmod-cli: " << command[0] << " lacks "
+                      << lower_copy(category) << "(" << kind
+                      << "); leaving out interfaces that use it\n";
+      }
+
       fxmod::EmitResult r;
       try {
-        r = mf->emit_fortran_source(/*strict=*/!best_effort);
+        r = mf->emit_fortran_source(*options);
       } catch (const std::exception &e) {
         if (verbose)
           std::cerr << "fxmod-cli: skipping " << mod_path << ": " << e.what()

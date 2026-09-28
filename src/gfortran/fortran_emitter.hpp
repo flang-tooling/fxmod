@@ -10,6 +10,7 @@
 #pragma once
 
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "module.hpp"
@@ -28,6 +29,11 @@ struct EmitResult {
 // strict = false: returns the best-effort source (everything that could be
 // translated) together with the list of problems, letting the caller decide
 // what to do about the gap.
-EmitResult emit_fortran_source(const Module &module, bool strict = true);
+//
+// `unsupported_kinds`: (category, kind) pairs the target compiler lacks;
+// see fxmod::EmitOptions.
+using UnsupportedKinds = std::vector<std::pair<std::string, int>>;
+EmitResult emit_fortran_source(const Module &module, bool strict = true,
+                               const UnsupportedKinds &unsupported_kinds = {});
 
 } // namespace fxmod::gfortran

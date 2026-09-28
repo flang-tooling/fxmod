@@ -33,6 +33,36 @@ std::string lower(const std::string &s) {
   return out;
 }
 
+// The first type `ts` spells that the target lacks, e.g. "real(16)".
+std::optional<std::string> unsupported_type(const std::optional<TypeSpec> &ts,
+                                            const UnsupportedKinds &kinds) {
+  if (!ts || !ts->kind)
+    return std::nullopt;
+  const std::string category = ts->base == "COMPLEX" ? "REAL" : ts->base;
+  for (const auto &[base, kind] : kinds)
+    if (base == category && kind == *ts->kind)
+      return lower(ts->base) + "(" + std::to_string(kind) + ")";
+  return std::nullopt;
+}
+
+// Same for a symbol: its own type (a function's result), and a
+// procedure's dummy arguments.
+std::optional<std::string> unsupported_type(const Symbol &sym,
+                                            const std::map<int, Symbol> &symbols,
+                                            const UnsupportedKinds &kinds) {
+  if (kinds.empty())
+    return std::nullopt;
+  if (auto t = unsupported_type(sym.typespec, kinds))
+    return t;
+  for (int ref : sym.formal_args) {
+    auto it = symbols.find(ref);
+    if (it != symbols.end())
+      if (auto t = unsupported_type(it->second.typespec, kinds))
+        return t;
+  }
+  return std::nullopt;
+}
+
 // A REAL constant's value as gfortran writes it: mpfr_get_str() in base 16
 // (mio_gmp_real() in module.cc), i.e. an optional sign, "0.", hexadecimal
 // mantissa digits, then "@" and the power of 16 in decimal -- "-0.199999a@0"
@@ -456,7 +486,8 @@ std::vector<std::string> emit_generic(const std::string &public_name,
                                        const std::string &current_module,
                                        NeededUses &uses,
                                        std::set<int> &specifics_already_declared,
-                                       const std::set<int> &reexported) {
+                                       const std::set<int> &reexported,
+                                       const UnsupportedKinds &kinds) {
   // Built up locally and only merged into the shared set once the whole
   // generic succeeds -- a generic that fails partway through (any one
   // specific unsupported) must not "claim" the specifics it did manage to
@@ -480,6 +511,8 @@ std::vector<std::string> emit_generic(const std::string &public_name,
       throw UnsupportedError("specific procedure '" + it->second.name +
                               "' is an internal compiler-generated symbol "
                               "with no valid Fortran spelling");
+    if (unsupported_type(it->second, symbols, kinds))
+      continue; // the target could not call it anyway
     if (reexported.count(specific_num)) {
       record_use(foreign_uses, it->second.module_name, it->second.name,
                  it->second.name);
@@ -495,6 +528,8 @@ std::vector<std::string> emit_generic(const std::string &public_name,
     lines.insert(lines.end(), body.begin(), body.end());
     newly_claimed.push_back(specific_num);
   }
+  if (lines.size() == 1)
+    throw UnsupportedError("every specific uses a type the target lacks");
   lines.push_back("end interface " + public_name);
   specifics_already_declared.insert(newly_claimed.begin(), newly_claimed.end());
   for (auto &[key, mu] : foreign_uses) {
@@ -528,7 +563,8 @@ Analysis analyse(const std::map<int, Symbol> &symbols,
                   const std::map<std::string, int> &symtree,
                   const std::map<std::string, GenericInterface> &generics,
                   const std::vector<OperatorInterface> &operators,
-                  const std::string &current_module) {
+                  const std::string &current_module,
+                  const UnsupportedKinds &kinds) {
   Analysis a;
   std::set<int> emitted;
   std::set<std::string> handled_generic_names;
@@ -607,6 +643,12 @@ Analysis analyse(const std::map<int, Symbol> &symbols,
         a.problems.push_back("type '" + public_name + "': component '" +
                               comp.name + "' has a type that cannot be "
                               "expressed");
+        return;
+      }
+      if (auto t = unsupported_type(comp.typespec, kinds)) {
+        a.problems.push_back("type '" + public_name + "': component '" +
+                              comp.name + "' is " + *t +
+                              ", which is not available on the target");
         return;
       }
       try {
@@ -738,11 +780,24 @@ Analysis analyse(const std::map<int, Symbol> &symbols,
       // this module's copy is only a reference, so `use` the original
       // rather than redeclaring it -- a redeclaration would be a distinct
       // entity, and clash with the original wherever both are visible.
+      if (unsupported_type(sym, symbols, kinds)) {
+        // Left out of its own module's translation as well.
+        emitted.insert(number);
+        continue;
+      }
       record_use(a.uses, sym.module_name, sym.name, public_name);
       emitted.insert(number);
       continue;
     }
 
+    // (A generic's specifics are vetted where the generic is emitted.)
+    if ((sym.flavor() != "PROCEDURE" || !sym.is_generic()) &&
+        !specifics_used_in_generics.count(number))
+      if (auto t = unsupported_type(sym, symbols, kinds)) {
+        a.problems.push_back("'" + public_name + "': " + *t +
+                              " is not available on the target");
+        continue;
+      }
     if (sym.flavor() == "PARAMETER") {
       if (!sym.typespec.has_value() || !sym.value_node.has_value()) {
         a.problems.push_back("named constant '" + public_name +
@@ -801,7 +856,7 @@ Analysis analyse(const std::map<int, Symbol> &symbols,
       try {
         std::vector<std::string> lines = emit_generic(
             public_name, git->second.specifics, symbols, current_module,
-            a.uses, specifics_already_declared, reexported);
+            a.uses, specifics_already_declared, reexported, kinds);
         a.body.insert(a.body.end(), lines.begin(), lines.end());
         emitted.insert(number);
       } catch (const fxmod::Error &exc) {
@@ -862,7 +917,7 @@ Analysis analyse(const std::map<int, Symbol> &symbols,
     try {
       std::vector<std::string> lines = emit_generic(
           gi.name, gi.specifics, symbols, current_module, a.uses,
-          specifics_already_declared, reexported);
+          specifics_already_declared, reexported, kinds);
       a.body.insert(a.body.end(), lines.begin(), lines.end());
     } catch (const fxmod::Error &exc) {
       a.problems.push_back("generic '" + gi.name + "': " + exc.what());
@@ -888,7 +943,7 @@ Analysis analyse(const std::map<int, Symbol> &symbols,
     try {
       std::vector<std::string> lines =
           emit_generic(op.spelling, local, symbols, current_module, a.uses,
-                       specifics_already_declared, reexported);
+                       specifics_already_declared, reexported, kinds);
       a.body.insert(a.body.end(), lines.begin(), lines.end());
     } catch (const fxmod::Error &exc) {
       a.problems.push_back(op.spelling + ": " + exc.what());
@@ -945,7 +1000,8 @@ std::string summarise_problems(const std::vector<std::string> &problems,
 
 } // namespace
 
-EmitResult emit_fortran_source(const Module &module, bool strict) {
+EmitResult emit_fortran_source(const Module &module, bool strict,
+                               const UnsupportedKinds &kinds) {
   std::map<int, Symbol> symbols = parse_symbols(module);
   std::map<std::string, int> symtree = parse_symtree(module);
   if (symtree.empty())
@@ -954,7 +1010,7 @@ EmitResult emit_fortran_source(const Module &module, bool strict) {
   std::vector<OperatorInterface> operators = parse_operator_interfaces(module);
   std::string name = module.name();
 
-  Analysis a = analyse(symbols, symtree, generics, operators, name);
+  Analysis a = analyse(symbols, symtree, generics, operators, name, kinds);
   if (!a.problems.empty() && strict) {
     throw UnsupportedError(module.path + ": " +
                             std::to_string(a.problems.size()) +
