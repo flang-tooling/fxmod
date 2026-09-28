@@ -1,6 +1,10 @@
 #include "fortran_emitter.hpp"
 
 #include <algorithm>
+#include <cerrno>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <regex>
 #include <set>
@@ -28,10 +32,39 @@ std::string lower(const std::string &s) {
   return out;
 }
 
+// A REAL constant's value as gfortran writes it: mpfr_get_str() in base 16
+// (mio_gmp_real() in module.cc), i.e. an optional sign, "0.", hexadecimal
+// mantissa digits, then "@" and the power of 16 in decimal -- "-0.199999a@0"
+// is -0x0.199999a, "0.78@31" is 0x0.78 * 16^31. Rendered as a decimal
+// literal with enough digits to round-trip at `kind` (the value is exactly
+// representable there, having been rounded to it by gfortran), kind
+// suffix included. Kinds without a C++ double to carry them (10, 16) and
+// the non-finite spellings are refused.
+std::optional<std::string> real_literal(const std::string &text, int kind) {
+  static const std::regex kMpfr(R"((-?)0\.([0-9a-f]+)@(-?\d+))");
+  std::smatch m;
+  if ((kind != 4 && kind != 8) || !std::regex_match(text, m, kMpfr))
+    return std::nullopt;
+  // The same number as a C99 hexadecimal float: each hex digit is 4 bits.
+  const long exponent = std::stol(m[3].str()) * 4;
+  const std::string hex = m[1].str() + "0x0." + m[2].str() + "p" +
+                           std::to_string(exponent);
+  errno = 0;
+  const double value = std::strtod(hex.c_str(), nullptr);
+  if (errno != 0 || !std::isfinite(value))
+    return std::nullopt;
+  char buf[64];
+  std::snprintf(buf, sizeof buf, kind == 4 ? "%.9g" : "%.17g", value);
+  std::string out = buf;
+  if (out.find_first_of(".e") == std::string::npos)
+    out += ".0"; // "42" would be an INTEGER literal
+  return out + "_" + std::to_string(kind);
+}
+
 // Renders a raw value expression node (see mio_expr() in module.cc) as
 // Fortran text, recursively for a structure constructor's component
 // values. Only two expression kinds are supported: CONSTANT (a scalar
-// literal -- integer, logical, or character) and STRUCTURE (a derived-
+// literal -- integer, real, complex, logical, or character) and STRUCTURE (a derived-
 // type constant, e.g. a TYPE(foo) PARAMETER initialised to foo(1, 2)).
 // Returns nullopt for anything else (a general expression, an array
 // constructor, ...) so the caller can refuse rather than guess. Deferred
@@ -69,6 +102,17 @@ std::optional<std::string> render_value(const sexpr::Node &node,
         return raw.integer() != 0 ? ".true." : ".false.";
       if (raw.is_str() && (raw.str() == "0" || raw.str() == "1"))
         return raw.str() == "1" ? ".true." : ".false.";
+    } else if (ts->base == "REAL" && ts->kind) {
+      if (raw.is_str())
+        return real_literal(raw.str(), *ts->kind);
+    } else if (ts->base == "COMPLEX" && ts->kind) {
+      // Real and imaginary part, each written like a REAL constant.
+      if (raw.is_str() && l.size() > 4 && l[4].is_str()) {
+        std::optional<std::string> re = real_literal(raw.str(), *ts->kind);
+        std::optional<std::string> im = real_literal(l[4].str(), *ts->kind);
+        if (re && im)
+          return "(" + *re + ", " + *im + ")";
+      }
     } else if (ts->base == "CHARACTER") {
       if (raw.is_str()) {
         std::string escaped;
