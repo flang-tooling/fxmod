@@ -16,6 +16,13 @@ namespace fxmod::gfortran {
 
 namespace {
 
+// Modules every compiler ships its own version of, with differing
+// contents: a re-export names only what gfortran's has, which the target
+// compiler's may lack. They are used whole instead (renames excepted), and
+// are available wherever the compiler is.
+const std::set<std::string> kCompilerSupplied = {"omp_lib", "omp_lib_kinds",
+                                                 "openacc", "openacc_kinds"};
+
 struct Analysis {
   std::vector<std::string> body;
   std::vector<std::string> problems;
@@ -568,9 +575,10 @@ Analysis analyse(const std::map<int, Symbol> &symbols,
                   const AvailableModules &available) {
   // Whether a `use` of `module` can compile where the source is going.
   auto usable = [&available](const std::string &module) {
-    if (!available || resolve_module_name(module).intrinsic)
-      return true;
     const std::string key = lower(module);
+    if (!available || resolve_module_name(module).intrinsic ||
+        kCompilerSupplied.count(key))
+      return true;
     return std::find(available->begin(), available->end(), key) !=
            available->end();
   };
@@ -636,7 +644,6 @@ Analysis analyse(const std::map<int, Symbol> &symbols,
         return;
       }
     }
-
     std::vector<std::string> lines;
     std::string header = "type";
     if (has_attr(sym, "ABSTRACT"))
@@ -763,7 +770,6 @@ Analysis analyse(const std::map<int, Symbol> &symbols,
       };
   for (const auto &[type, public_name] : type_names)
     declare_type(*type, public_name);
-
 
   // Then abstract interfaces: a procedure(iface) declaration anywhere below
   // may name one, and must come after it.
@@ -1056,7 +1062,16 @@ EmitResult emit_fortran_source(const Module &module, bool strict,
 
   std::string source = "module " + name + "\n";
   for (const auto &[key, mu] : a.uses) {
-    (void)key;
+    if (kCompilerSupplied.count(key)) {
+      source += "use " + mu.display_name + "\n";
+      std::string renames;
+      for (const std::string &clause : mu.only_clauses)
+        if (clause.find("=>") != std::string::npos && clause.find("operator(") != 0)
+          renames += (renames.empty() ? "" : ", ") + clause;
+      if (!renames.empty())
+        source += "use " + mu.display_name + ", only: " + renames + "\n";
+      continue;
+    }
     source += mu.intrinsic ? "use, intrinsic :: " : "use ";
     source += mu.display_name;
     if (!mu.only_clauses.empty()) {

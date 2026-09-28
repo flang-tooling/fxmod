@@ -5,7 +5,8 @@
 // drops it. available_modules: a re-export from a module outside the list
 // is declared from the re-exporting module's own copy -- a constant by its
 // value, a procedure by its interface, a type by its components -- since a
-// `use` of it could not compile; a variable is a problem.
+// `use` of it could not compile; a variable is a problem. Independently of
+// either, re-exports of the compilers' own OpenMP module use it whole.
 #include <fxmod/module.hpp>
 
 #include "test_util.hpp"
@@ -71,6 +72,14 @@ int main() {
                       .emit_fortran_source(alone)
                       .source,
                   "use hidden_dep, only:"));
+
+  fs::path omp = fresh_dir("fxmod-target-options-test-omp");
+  gfortran_fixture_modules(omp, {"openmp_reexport.f90"}, "-fopenmp");
+  fxmod::EmitResult o =
+      fxmod::ModuleFile::open((omp / "openmp_reexport.mod").string())
+          .emit_fortran_source(true);
+  FXMOD_CHECK(has(o.source, "\nuse omp_lib\n"));
+  FXMOD_CHECK(!has(o.source, "omp_lib, only"));
 
   std::puts("test_gfortran_target_options: OK");
   return 0;
