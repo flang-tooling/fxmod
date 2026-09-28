@@ -266,6 +266,9 @@ std::vector<std::string> emit_interface_body(const std::string &public_name,
     for (const char *attr : {"POINTER", "ALLOCATABLE"})
       if (has_attr(*result, attr) || has_attr(sym, attr))
         decl += ", " + lower(attr);
+    if (std::string ca = class_attribute(*type, symbols); !ca.empty() &&
+        decl.find(", " + ca) == std::string::npos)
+      decl += ", " + ca;
     lines.push_back("    " + decl + " :: " + public_name);
   }
 
@@ -304,6 +307,9 @@ std::vector<std::string> emit_interface_body(const std::string &public_name,
                                "CONTIGUOUS"})
         if (has_attr(*d, attr))
           decl += ", " + lower(attr);
+      if (std::string ca = class_attribute(*d->typespec, symbols); !ca.empty() &&
+          decl.find(", " + ca) == std::string::npos)
+        decl += ", " + ca;
     }
     if (has_attr(*d, "OPTIONAL"))
       decl += ", optional";

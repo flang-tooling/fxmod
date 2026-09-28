@@ -72,6 +72,10 @@ struct TypeSpec {
   std::string base; // INTEGER, REAL, LOGICAL, CHARACTER, DERIVED, ...
   std::optional<int> kind;
   std::optional<int> derived_ref;
+  // CLASS(...) rather than TYPE(...): `derived_ref` then names gfortran's
+  // internal __class_* container, whose _data component carries the
+  // declared type.
+  bool is_class = false;
   // The interface of a procedure entity declared `procedure(iface)`, by
   // symbol number: the typespec's third item. A procedure dummy with such
   // an interface has base "UNKNOWN".
@@ -98,7 +102,13 @@ struct TypeSpec {
 // into a refusal.
 std::optional<TypeSpec> parse_typespec(const sexpr::Node &node);
 
+// For a CLASS(...) typespec: the pointer/allocatable attribute of the
+// entity, which gfortran encodes in the name of its __class_* container
+// rather than on the entity ("pointer", "allocatable" or "").
+std::string class_attribute(const TypeSpec &ts, const std::map<int, Symbol> &symbols);
+
 struct Component {
+  int id = 0; // the number a COMPONENT reference names it by
   std::string name;
   // Unset when the type could not be interpreted; only fatal if the
   // containing type actually has to be emitted.
@@ -121,6 +131,9 @@ struct ArrayBound {
   Kind kind = Kind::Absent;
   std::string constant_text; // valid when kind == Constant
   int symbol_ref = 0;        // valid when kind == SymbolRef
+  // For a SymbolRef: a component path below the symbol (`self%n`), as
+  // (derived-type symbol, component id) pairs from the reference list.
+  std::vector<std::pair<int, int>> components;
 };
 
 struct ArraySpec {

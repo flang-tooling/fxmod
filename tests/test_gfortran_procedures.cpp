@@ -1,9 +1,11 @@
 // Procedure interfaces beyond plain data dummies: dummy procedures
-// (procedure(iface), external, procedure pointers), the attributes that
-// change what an actual may be (value, pointer, allocatable, target,
-// contiguous), and a result variable declared apart from the function,
-// whose attributes are the result's. The abstract interface a procedure
-// dummy names must be declared ahead of its users.
+// (procedure(iface), external), the attributes that change what an actual
+// may be (value, pointer, allocatable, target, contiguous), CLASS dummies
+// and results -- whose pointer/allocatable gfortran encodes in the name of
+// the __class_* container -- a result variable declared apart from the
+// function, and an explicit-shape bound reaching into a CLASS dummy
+// (`v(grid%n)`, as ELPA's interfaces have). The abstract interface a
+// procedure dummy names must be declared ahead of its users.
 #include <fxmod/module.hpp>
 
 #include "test_util.hpp"
@@ -28,6 +30,10 @@ int main() {
            "real(8), dimension(:), intent(inout), allocatable :: q",
            "real(8), intent(in), target :: t",
            "real(8), dimension(:), intent(in), contiguous :: c",
+           "class(Grid_t), intent(in) :: grid",
+           "real(8), dimension(grid%n), intent(in) :: v",
+           "class(Grid_t), pointer :: make",
+           "class(*), intent(in) :: x",
            "real(8), dimension(:), allocatable :: series",
        })
     if (src.find(decl) == std::string::npos) {
@@ -43,13 +49,16 @@ int main() {
                          "  use procedures\n"
                          "  implicit none\n"
                          "  procedure(kernel_i), pointer :: pk => null()\n"
+                         "  class(grid_t), pointer :: g\n"
                          "  real(8), allocatable :: q(:)\n"
                          "  real(8), pointer :: p(:) => null()\n"
                          "  real(8), target :: t\n"
                          "  real(8), external :: ext\n"
+                         "  g => make(4)\n"
                          "  call attrs(1, p, q, t, [1d0, 2d0])\n"
+                         "  call sized(g, [1d0, 2d0, 3d0, 4d0])\n"
                          "  call apply(pk, pk, ext, t)\n"
-                         "  q = series(3)\n"
+                         "  if (any_of(g)) q = series(3)\n"
                          "end program user\n");
 
   std::puts("test_gfortran_procedures: OK");

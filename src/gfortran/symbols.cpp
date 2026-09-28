@@ -74,6 +74,7 @@ std::vector<Component> parse_components(const Node &node) {
     if (entry.is_list() && entry.list().size() >= 3 &&
         entry.list()[0].is_int() && entry.list()[1].is_str()) {
       Component c;
+      c.id = static_cast<int>(entry.list()[0].integer());
       c.name = entry.list()[1].str();
       c.typespec = parse_typespec(entry.list()[2]);
       components.push_back(std::move(c));
@@ -112,11 +113,25 @@ ArrayBound parse_bound(const Node &node) {
   }
   if (kind == "VARIABLE") {
     // (VARIABLE <typespec> <rank> <symtree-ref> <ref-list> ...) --
-    // mio_symtree_ref() writes a bare symbol number.
+    // mio_symtree_ref() writes a bare symbol number, mio_ref_list() one
+    // entry per reference below it. Component references (`self%n`, as
+    // (COMPONENT <derived-type> <component-id>)) are decoded; array and
+    // substring references are not.
     if (l.size() < 4 || !l[3].is_int())
       throw sexpr::FormatError("unsupported variable array bound");
     b.kind = ArrayBound::Kind::SymbolRef;
     b.symbol_ref = static_cast<int>(l[3].integer());
+    if (l.size() > 4 && l[4].is_list()) {
+      for (const Node &ref : l[4].list()) {
+        if (!ref.is_list() || ref.list().size() < 3 || !ref.list()[0].is_name() ||
+            ref.list()[0].name() != "COMPONENT" || !ref.list()[1].is_int() ||
+            !ref.list()[2].is_int())
+          throw sexpr::FormatError("array bound reference is not decoded "
+                                    "(only component references are)");
+        b.components.emplace_back(static_cast<int>(ref.list()[1].integer()),
+                                  static_cast<int>(ref.list()[2].integer()));
+      }
+    }
     return b;
   }
   throw sexpr::FormatError("array bound expression '" + kind +
@@ -135,7 +150,26 @@ std::string bound_text(const ArrayBound &b, const std::map<int, Symbol> &symbols
     if (it == symbols.end())
       throw sexpr::FormatError("array bound references unknown symbol " +
                                 std::to_string(b.symbol_ref));
-    return it->second.name;
+    std::string text = it->second.name;
+    for (const auto &[type_ref, comp_id] : b.components) {
+      (void)type_ref;
+      // Component ids share the symbol pool's numbering, so the id alone
+      // identifies the component -- which need not belong to the type the
+      // reference names: through a CLASS dummy that is the __class_*
+      // container, and the component one of the declared type's.
+      const Component *comp = nullptr;
+      for (const auto &[number, sym] : symbols) {
+        (void)number;
+        for (const Component &c : sym.components)
+          if (c.id == comp_id)
+            comp = &c;
+      }
+      if (comp == nullptr)
+        throw sexpr::FormatError("array bound references unknown component " +
+                                  std::to_string(comp_id));
+      text += "%" + comp->name;
+    }
+    return text;
   }
   }
   return "";
@@ -189,6 +223,7 @@ std::optional<TypeSpec> parse_typespec(const Node &node) {
   if (base == "DERIVED" || base == "CLASS") {
     TypeSpec ts;
     ts.base = "DERIVED";
+    ts.is_class = base == "CLASS";
     ts.derived_ref = second_as_int();
     ts.interface_ref = interface_ref;
     return ts;
@@ -210,6 +245,27 @@ std::string TypeSpec::to_fortran(const std::map<int, Symbol> &symbols,
     if (it == symbols.end())
       throw sexpr::FormatError("derived typespec references unknown symbol " +
                                 std::to_string(*derived_ref));
+    if (is_class) {
+      // CLASS(t) points at gfortran's __class_* container; its _data
+      // component is typed with the declared type. CLASS(*)'s is the
+      // internal STAR type.
+      auto data = std::find_if(it->second.components.begin(),
+                               it->second.components.end(),
+                               [](const Component &c) { return c.name == "_data"; });
+      if (data == it->second.components.end() || !data->typespec ||
+          !data->typespec->derived_ref)
+        throw sexpr::FormatError("class typespec without a declared type");
+      auto declared = symbols.find(*data->typespec->derived_ref);
+      if (declared == symbols.end())
+        throw sexpr::FormatError("class typespec references unknown symbol " +
+                                  std::to_string(*data->typespec->derived_ref));
+      if (lower_copy(declared->second.name) == "star")
+        return "class(*)";
+      if (!same_module(declared->second.module_name, current_module))
+        record_use(uses, declared->second.module_name, declared->second.name,
+                   declared->second.name);
+      return "class(" + declared->second.name + ")";
+    }
     if (!same_module(it->second.module_name, current_module))
       record_use(uses, it->second.module_name, it->second.name,
                  it->second.name);
@@ -231,6 +287,27 @@ std::string TypeSpec::to_fortran(const std::map<int, Symbol> &symbols,
   if (base == "ASSUMED")
     return "type(*)"; // assumed type, e.g. an MPI choice buffer
   throw sexpr::FormatError("unsupported base type " + base);
+}
+
+std::string class_attribute(const TypeSpec &ts, const std::map<int, Symbol> &symbols) {
+  if (!ts.is_class || !ts.derived_ref)
+    return "";
+  auto it = symbols.find(*ts.derived_ref);
+  if (it == symbols.end())
+    return "";
+  // gfc_build_class_symbol() in class.cc names the container after the
+  // entity's attributes: __class_<type>_p for a pointer, _a for an
+  // allocatable, _t for neither; _<rank>_<corank>p/a/t for an array.
+  const std::string &name = it->second.name;
+  static const std::regex kSuffix(R"(_(\d+_\d+)?([pat])$)");
+  std::smatch m;
+  if (!std::regex_search(name, m, kSuffix))
+    return "";
+  if (m[2] == "p")
+    return "pointer";
+  if (m[2] == "a")
+    return "allocatable";
+  return "";
 }
 
 std::optional<ArraySpec> parse_array_spec(const Node &node) {
