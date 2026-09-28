@@ -158,6 +158,10 @@ struct Symbol {
   // Symbol numbers of the dummy arguments, in order.
   std::vector<int> formal_args;
   std::optional<ArraySpec> array_spec;
+  // The ext_attr bitmask from the attribute list (!GCC$ ATTRIBUTES), bit
+  // numbers per ext_attr_id_t in gfortran.h.
+  unsigned ext_attr = 0;
+  static constexpr unsigned kExtAttrNoArgCheck = 1u << 5;
 
   // Fortran intent clause for a dummy argument, if it has one. Attribute
   // slot 1 is IN / OUT / INOUT / UNKNOWN-INTENT when DUMMY is set.

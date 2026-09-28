@@ -216,6 +216,8 @@ std::string TypeSpec::to_fortran(const std::map<int, Symbol> &symbols,
       throw sexpr::FormatError("character typespec has no kind");
     return "character(kind=" + std::to_string(*kind) + ")";
   }
+  if (base == "ASSUMED")
+    return "type(*)"; // assumed type, e.g. an MPI choice buffer
   throw sexpr::FormatError("unsupported base type " + base);
 }
 
@@ -333,10 +335,17 @@ std::map<int, Symbol> parse_symbols(const Module &module) {
       const List &body = flat[i + 5].list();
 
       std::vector<std::string> attrs;
-      if (!body.empty() && body[0].is_list())
-        for (const Node &a : body[0].list())
+      // mio_symbol_attribute(): flavor, intent, proc, if_source, save,
+      // ext_attr, extension, then the attribute names.
+      unsigned ext_attr = 0;
+      if (!body.empty() && body[0].is_list()) {
+        const List &al = body[0].list();
+        for (const Node &a : al)
           if (a.is_name())
             attrs.push_back(a.name());
+        if (al.size() > 5 && al[5].is_int())
+          ext_attr = static_cast<unsigned>(al[5].integer());
+      }
 
       const Node *raw_components =
           body.size() > 1 ? &body[1] : nullptr;
@@ -401,6 +410,7 @@ std::map<int, Symbol> parse_symbols(const Module &module) {
       sym.value_node = std::move(value_node);
       sym.formal_args = std::move(formal_args);
       sym.array_spec = std::move(array_spec);
+      sym.ext_attr = ext_attr;
       symbols[number] = std::move(sym);
 
       i += 6;

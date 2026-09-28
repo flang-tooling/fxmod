@@ -266,6 +266,15 @@ std::vector<std::string> emit_interface_body(const std::string &public_name,
       decl += ", optional";
     lines.push_back("    " + decl + " :: " + d->name);
   }
+  // gfortran's NO_ARG_CHECK (type, kind and rank of the actual go
+  // unchecked, e.g. MPI and OpenACC choice buffers) in both compilers'
+  // spellings -- each ignores the other's directive. Without it a generic
+  // over such specifics can be ambiguous by the standard's rules.
+  for (const Symbol *d : dummies)
+    if (d->ext_attr & Symbol::kExtAttrNoArgCheck) {
+      lines.push_back("    !GCC$ ATTRIBUTES NO_ARG_CHECK :: " + d->name);
+      lines.push_back("    !DIR$ IGNORE_TKR (tkr) " + d->name);
+    }
 
   lines.push_back(std::string("  end ") + kind + " " + public_name);
   return lines;

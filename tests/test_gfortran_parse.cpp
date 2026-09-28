@@ -32,7 +32,7 @@ int main() {
   const Expected cases[] = {
       {"omp_lib_kinds.mod", 118, 0},   {"openacc_kinds.mod", 20, 0},
       {"ieee_features.mod", 17, 0},    {"ieee_exceptions.mod", 31, 2},
-      {"openacc.mod", 28, 26},         {"ieee_arithmetic.mod", 62, 29},
+      {"openacc.mod", 28, 0},          {"ieee_arithmetic.mod", 62, 29},
       {"omp_lib.mod", 232, 0},
   };
 
