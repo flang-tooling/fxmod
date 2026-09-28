@@ -61,6 +61,47 @@ std::optional<std::string> real_literal(const std::string &text, int kind) {
   return out + "_" + std::to_string(kind);
 }
 
+// A character constant's value, from gfortran's escaped spelling, as a
+// Fortran expression: printable runs quoted, anything else as achar().
+std::optional<std::string> character_literal(const std::string &text) {
+  std::vector<std::string> parts;
+  std::string run;
+  auto flush = [&]() {
+    if (!run.empty())
+      parts.push_back("'" + run + "'");
+    run.clear();
+  };
+  for (std::size_t i = 0; i < text.size(); ++i) {
+    unsigned code;
+    if (text[i] == '\\' && i + 1 < text.size() && text[i + 1] == '\\') {
+      code = '\\';
+      ++i;
+    } else if (text[i] == '\\' && i + 9 < text.size() && text[i + 1] == 'U') {
+      code = static_cast<unsigned>(std::stoul(text.substr(i + 2, 8), nullptr, 16));
+      i += 9;
+    } else {
+      code = static_cast<unsigned char>(text[i]);
+    }
+    if (code > 255)
+      return std::nullopt; // not a kind=1 character
+    if (code >= 0x20 && code < 0x7f) {
+      run += static_cast<char>(code);
+      if (code == '\'')
+        run += '\''; // doubled inside a quoted run
+    } else {
+      flush();
+      parts.push_back("achar(" + std::to_string(code) + ")");
+    }
+  }
+  flush();
+  if (parts.empty())
+    return "''";
+  std::string out;
+  for (std::size_t i = 0; i < parts.size(); ++i)
+    out += (i ? "//" : "") + parts[i];
+  return out;
+}
+
 // Renders a raw value expression node (see mio_expr() in module.cc) as
 // Fortran text, recursively for a structure constructor's component
 // values. Only two expression kinds are supported: CONSTANT (a scalar
@@ -114,16 +155,11 @@ std::optional<std::string> render_value(const sexpr::Node &node,
           return "(" + *re + ", " + *im + ")";
       }
     } else if (ts->base == "CHARACTER") {
-      if (raw.is_str()) {
-        std::string escaped;
-        for (char c : raw.str()) {
-          if (c == '\'')
-            escaped += "''";
-          else
-            escaped += c;
-        }
-        return "'" + escaped + "'";
-      }
+      // (CONSTANT <ts> <rank> <length> '<string>'), the string with
+      // gfortran's escapes (quote_string() in module.cc): \\ for a
+      // backslash, \Uxxxxxxxx for any character that is not printable.
+      if (l.size() > 4 && l[4].is_str())
+        return character_literal(l[4].str());
     }
     return std::nullopt;
   }
@@ -601,6 +637,13 @@ Analysis analyse(const std::map<int, Symbol> &symbols,
             sym.typespec->to_fortran(symbols, current_module, a.uses);
         if (sym.array_spec)
           decl += ", dimension" + sym.array_spec->to_fortran(symbols);
+        // Deferred shapes and lengths are only valid on these.
+        for (const char *attr : {"ALLOCATABLE", "POINTER", "TARGET"})
+          if (has_attr(sym, attr))
+            decl += ", " + lower(attr);
+        if (std::string ca = class_attribute(*sym.typespec, symbols);
+            !ca.empty() && decl.find(", " + ca) == std::string::npos)
+          decl += ", " + ca;
         a.body.push_back(decl + " :: " + public_name);
         emitted.insert(number);
       } catch (const sexpr::FormatError &exc) {

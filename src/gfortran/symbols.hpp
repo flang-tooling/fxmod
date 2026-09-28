@@ -68,6 +68,23 @@ ResolvedModuleName resolve_module_name(const std::string &module_name);
 void record_use(NeededUses &uses, const std::string &module_name,
                  const std::string &real_name, const std::string &local_name);
 
+// One dimension's bounds, from mio_array_spec()'s per-dimension mio_expr()
+// calls. A bound is either absent (assumed-shape's/deferred's upper bound,
+// or a defaulted lower bound), a compile-time constant (rendered
+// immediately -- constants never reference another symbol, so there's no
+// forward-reference concern), or a reference to another symbol by number
+// (typically a dummy argument used as an extent, e.g. `x(n)`) -- kept as
+// a number and resolved to a name only at emission time.
+struct ArrayBound {
+  enum class Kind { Absent, Constant, SymbolRef };
+  Kind kind = Kind::Absent;
+  std::string constant_text; // valid when kind == Constant
+  int symbol_ref = 0;        // valid when kind == SymbolRef
+  // For a SymbolRef: a component path below the symbol (`self%n`), as
+  // (derived-type symbol, component id) pairs from the reference list.
+  std::vector<std::pair<int, int>> components;
+};
+
 struct TypeSpec {
   std::string base; // INTEGER, REAL, LOGICAL, CHARACTER, DERIVED, ...
   std::optional<int> kind;
@@ -80,6 +97,11 @@ struct TypeSpec {
   // symbol number: the typespec's third item. A procedure dummy with such
   // an interface has base "UNKNOWN".
   std::optional<int> interface_ref;
+  // CHARACTER length: a constant or a symbol (`len=n`), assumed (`len=*`),
+  // deferred (`len=:`), or not decoded (unset, rendered without a length).
+  enum class CharLen { None, Bound, Assumed, Deferred };
+  CharLen char_len = CharLen::None;
+  ArrayBound char_len_bound; // valid when char_len == Bound
 
   // Renders as a Fortran type-spec, e.g. "integer(4)" or "type(foo)".
   // `current_module` is the module being emitted: a DERIVED reference to a
@@ -117,23 +139,6 @@ struct Component {
   // gfortran vtable machinery: _copy, _vptr, _hash, _size, ... has no
   // source spelling and is never emitted.
   bool is_internal() const { return !name.empty() && name.front() == '_'; }
-};
-
-// One dimension's bounds, from mio_array_spec()'s per-dimension mio_expr()
-// calls. A bound is either absent (assumed-shape's/deferred's upper bound,
-// or a defaulted lower bound), a compile-time constant (rendered
-// immediately -- constants never reference another symbol, so there's no
-// forward-reference concern), or a reference to another symbol by number
-// (typically a dummy argument used as an extent, e.g. `x(n)`) -- kept as
-// a number and resolved to a name only at emission time.
-struct ArrayBound {
-  enum class Kind { Absent, Constant, SymbolRef };
-  Kind kind = Kind::Absent;
-  std::string constant_text; // valid when kind == Constant
-  int symbol_ref = 0;        // valid when kind == SymbolRef
-  // For a SymbolRef: a component path below the symbol (`self%n`), as
-  // (derived-type symbol, component id) pairs from the reference list.
-  std::vector<std::pair<int, int>> components;
 };
 
 struct ArraySpec {

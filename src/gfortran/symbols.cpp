@@ -232,6 +232,24 @@ std::optional<TypeSpec> parse_typespec(const Node &node) {
   ts.base = base;
   ts.kind = second_as_int();
   ts.interface_ref = interface_ref;
+  if (base == "CHARACTER" && l.size() > 6 && l[6].is_list()) {
+    // mio_charlen(): ( <length-expr> ), the expression empty for len=*
+    // and len=:, which a trailing DEFERRED_CL tells apart.
+    const List &cl = l[6].list();
+    if (l.size() > 7 && l[7].is_name() && l[7].name() == "DEFERRED_CL") {
+      ts.char_len = TypeSpec::CharLen::Deferred;
+    } else if (cl.size() == 1 && cl[0].is_list() && cl[0].list().empty()) {
+      ts.char_len = TypeSpec::CharLen::Assumed;
+    } else if (cl.size() == 1) {
+      try {
+        ts.char_len_bound = parse_bound(cl[0]);
+        ts.char_len = TypeSpec::CharLen::Bound;
+      } catch (const sexpr::FormatError &) {
+        // A length expression beyond a constant or plain reference: left
+        // undecoded, as before lengths were read at all.
+      }
+    }
+  }
   return ts;
 }
 
@@ -282,7 +300,21 @@ std::string TypeSpec::to_fortran(const std::map<int, Symbol> &symbols,
   if (base == "CHARACTER") {
     if (!kind.has_value())
       throw sexpr::FormatError("character typespec has no kind");
-    return "character(kind=" + std::to_string(*kind) + ")";
+    std::string len;
+    switch (char_len) {
+    case CharLen::None:
+      break;
+    case CharLen::Assumed:
+      len = "len=*, ";
+      break;
+    case CharLen::Deferred:
+      len = "len=:, ";
+      break;
+    case CharLen::Bound:
+      len = "len=" + bound_text(char_len_bound, symbols) + ", ";
+      break;
+    }
+    return "character(" + len + "kind=" + std::to_string(*kind) + ")";
   }
   if (base == "ASSUMED")
     return "type(*)"; // assumed type, e.g. an MPI choice buffer
