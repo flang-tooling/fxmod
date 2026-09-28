@@ -41,6 +41,14 @@ struct EmitOptions {
   // not call them -- and any other symbol using one is a problem. gfortran
   // modules only; ignored for the other families.
   std::vector<std::pair<std::string, int>> unsupported_kinds;
+  // The modules the compiler can find, lowercased. A gfortran module file
+  // carries everything it re-exports, so a library may well install it
+  // without the modules it USEs: what comes from one outside this list is
+  // declared from the module's own copy rather than use-associated
+  // (named constants and procedure interfaces; a variable would become a
+  // separate entity and is a problem instead). Unset: every module is
+  // assumed available. Intrinsic modules always are.
+  std::optional<std::vector<std::string>> available_modules;
 };
 
 // A parsed module file. Construct with ModuleFile::open(); the concrete

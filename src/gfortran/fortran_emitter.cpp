@@ -564,7 +564,16 @@ Analysis analyse(const std::map<int, Symbol> &symbols,
                   const std::map<std::string, GenericInterface> &generics,
                   const std::vector<OperatorInterface> &operators,
                   const std::string &current_module,
-                  const UnsupportedKinds &kinds) {
+                  const UnsupportedKinds &kinds,
+                  const AvailableModules &available) {
+  // Whether a `use` of `module` can compile where the source is going.
+  auto usable = [&available](const std::string &module) {
+    if (!available || resolve_module_name(module).intrinsic)
+      return true;
+    const std::string key = lower(module);
+    return std::find(available->begin(), available->end(), key) !=
+           available->end();
+  };
   Analysis a;
   std::set<int> emitted;
   std::set<std::string> handled_generic_names;
@@ -598,7 +607,8 @@ Analysis analyse(const std::map<int, Symbol> &symbols,
     auto it = symbols.find(number);
     if (it != symbols.end() && !it->second.module_name.empty() &&
         it->second.flavor() != "MODULE" && !it->second.is_artificial() &&
-        lower(it->second.module_name) != lower(current_module))
+        lower(it->second.module_name) != lower(current_module) &&
+        usable(it->second.module_name))
       reexported.insert(number);
   }
 
@@ -611,10 +621,22 @@ Analysis analyse(const std::map<int, Symbol> &symbols,
       // re-exporting via `use <module>, only: <name>` instead of
       // redeclaring it locally from this module's own (possibly
       // incomplete) copy of its component list.
-      record_use(a.uses, sym.module_name, sym.name, public_name);
-      emitted.insert(sym.number);
-      return;
+      if (usable(sym.module_name)) {
+        record_use(a.uses, sym.module_name, sym.name, public_name);
+        emitted.insert(sym.number);
+        return;
+      }
+      // Its module is not there to be used: redeclare it, as long as this
+      // copy carries the components (a stub does not).
+      if (sym.components.empty()) {
+        a.problems.push_back("type '" + public_name + "' comes from '" +
+                              sym.module_name + "', which is not available, "
+                              "and its components are not recorded here");
+        emitted.insert(sym.number);
+        return;
+      }
     }
+
     std::vector<std::string> lines;
     std::string header = "type";
     if (has_attr(sym, "ABSTRACT"))
@@ -785,9 +807,18 @@ Analysis analyse(const std::map<int, Symbol> &symbols,
         emitted.insert(number);
         continue;
       }
-      record_use(a.uses, sym.module_name, sym.name, public_name);
-      emitted.insert(number);
-      continue;
+      if (usable(sym.module_name)) {
+        record_use(a.uses, sym.module_name, sym.name, public_name);
+        emitted.insert(number);
+        continue;
+      }
+      // Its module is not there to be used: declare it from this module's
+      // copy below, which for a constant or an interface is as good.
+      if (sym.flavor() == "VARIABLE") {
+        a.problems.push_back("variable '" + public_name + "' comes from '" +
+                              sym.module_name + "', which is not available");
+        continue;
+      }
     }
 
     // (A generic's specifics are vetted where the generic is emitted.)
@@ -909,7 +940,8 @@ Analysis analyse(const std::map<int, Symbol> &symbols,
         continue;
       gi.name = derived_by_name.at(key)->name;
     }
-    if (!gi.module.empty() && lower(gi.module) != lower(current_module)) {
+    if (!gi.module.empty() && lower(gi.module) != lower(current_module) &&
+        usable(gi.module)) {
       // A generic USEd from its defining module and passed on.
       record_use(a.uses, gi.module, gi.name, gi.name);
       continue;
@@ -933,7 +965,8 @@ Analysis analyse(const std::map<int, Symbol> &symbols,
     for (int s : op.specifics) {
       auto it = symbols.find(s);
       if (it != symbols.end() && !it->second.module_name.empty() &&
-          lower(it->second.module_name) != lower(current_module))
+          lower(it->second.module_name) != lower(current_module) &&
+          usable(it->second.module_name))
         record_use(a.uses, it->second.module_name, op.spelling, op.spelling);
       else
         local.push_back(s);
@@ -965,7 +998,8 @@ Analysis analyse(const std::map<int, Symbol> &symbols,
       continue;
     const Symbol &proc = it->second;
     emitted.insert(target);
-    if (lower(proc.module_name) != lower(current_module)) {
+    if (lower(proc.module_name) != lower(current_module) &&
+        usable(proc.module_name)) {
       record_use(a.uses, proc.module_name, proc.name, proc.name);
       continue;
     }
@@ -1001,7 +1035,8 @@ std::string summarise_problems(const std::vector<std::string> &problems,
 } // namespace
 
 EmitResult emit_fortran_source(const Module &module, bool strict,
-                               const UnsupportedKinds &kinds) {
+                               const UnsupportedKinds &kinds,
+                               const AvailableModules &available) {
   std::map<int, Symbol> symbols = parse_symbols(module);
   std::map<std::string, int> symtree = parse_symtree(module);
   if (symtree.empty())
@@ -1010,7 +1045,8 @@ EmitResult emit_fortran_source(const Module &module, bool strict,
   std::vector<OperatorInterface> operators = parse_operator_interfaces(module);
   std::string name = module.name();
 
-  Analysis a = analyse(symbols, symtree, generics, operators, name, kinds);
+  Analysis a =
+      analyse(symbols, symtree, generics, operators, name, kinds, available);
   if (!a.problems.empty() && strict) {
     throw UnsupportedError(module.path + ": " +
                             std::to_string(a.problems.size()) +

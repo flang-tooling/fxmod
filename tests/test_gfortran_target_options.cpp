@@ -2,7 +2,10 @@
 // for. unsupported_kinds: a generic keeps only the specifics that compiler
 // can call, anything else using the kind is a problem, and a re-export of
 // such an entity is dropped silently, as its own module's translation
-// drops it.
+// drops it. available_modules: a re-export from a module outside the list
+// is declared from the re-exporting module's own copy -- a constant by its
+// value, a procedure by its interface, a type by its components -- since a
+// `use` of it could not compile; a variable is a problem.
 #include <fxmod/module.hpp>
 
 #include "test_util.hpp"
@@ -19,7 +22,8 @@ bool has(const std::string &src, const std::string &what) {
 
 int main() {
   fs::path gf = fresh_dir("fxmod-target-options-test");
-  gfortran_fixture_modules(gf, {"wide_kinds.f90", "wide_reexport.f90"});
+  gfortran_fixture_modules(gf, {"wide_kinds.f90", "wide_reexport.f90",
+                                "hidden_dep.f90", "passes_on.f90"});
 
   // Without options, the real(16) interfaces are translated (the real(16)
   // constant is not: its value is beyond what a double carries).
@@ -43,6 +47,30 @@ int main() {
           .emit_fortran_source(no_quad_strict);
   FXMOD_CHECK(has(re.source, "use wide_kinds, only: widen, widen_8"));
   FXMOD_CHECK(!has(re.source, "quad_one") && !has(re.source, "only_quad"));
+
+  // passes_on re-exports from hidden_dep, which is not available.
+  fxmod::EmitOptions alone;
+  alone.strict = false;
+  alone.available_modules = std::vector<std::string>{};
+  fxmod::EmitResult p =
+      fxmod::ModuleFile::open((gf / "passes_on.mod").string())
+          .emit_fortran_source(alone);
+  FXMOD_CHECK(!has(p.source, "use hidden_dep"));
+  FXMOD_CHECK(has(p.source, "integer(4), parameter :: version = 3"));
+  FXMOD_CHECK(has(p.source, "parameter :: label = 'dep'"));
+  FXMOD_CHECK(has(p.source, "function doubled(x)"));
+  FXMOD_CHECK(has(p.source, "type :: Item_t"));
+  FXMOD_CHECK_EQ(p.problems.size(), std::size_t(1));
+  FXMOD_CHECK(has(p.problems[0], "counter"));
+  fs::path out = fresh_dir("fxmod-target-options-test-out");
+  check_gfortran_accepts(out, "passes_on.f90", p.source); // no hidden_dep.mod
+
+  // Listed as available, hidden_dep is used as usual.
+  alone.available_modules = std::vector<std::string>{"hidden_dep"};
+  FXMOD_CHECK(has(fxmod::ModuleFile::open((gf / "passes_on.mod").string())
+                      .emit_fortran_source(alone)
+                      .source,
+                  "use hidden_dep, only:"));
 
   std::puts("test_gfortran_target_options: OK");
   return 0;

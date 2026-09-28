@@ -76,8 +76,8 @@ EmitResult ModuleFile::emit_fortran_source(const EmitOptions &options) const {
   const bool strict = options.strict;
   if (Family::Gfortran == family_) {
     const auto &m = std::get<gfortran::Module>(impl_->data);
-    gfortran::EmitResult r =
-        gfortran::emit_fortran_source(m, strict, options.unsupported_kinds);
+    gfortran::EmitResult r = gfortran::emit_fortran_source(
+        m, strict, options.unsupported_kinds, options.available_modules);
     return EmitResult{std::move(r.source), std::move(r.problems)};
   }
   if (Family::Flang == family_) {

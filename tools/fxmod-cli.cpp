@@ -486,6 +486,19 @@ int run_wrap(const std::vector<std::string> &args) {
         options.emplace();
         options->strict = !best_effort;
         options->unsupported_kinds = probe_unsupported_kinds(command[0], build);
+        // What a translation's `use` statements can find: every module
+        // file on the search path or already converted into the cache.
+        std::vector<std::string> available;
+        std::vector<std::string> scan = dirs;
+        scan.push_back(cache.string());
+        for (const std::string &d : scan) {
+          if (!fs::is_directory(d))
+            continue;
+          for (const auto &entry : fs::directory_iterator(d, ec))
+            if (entry.path().extension() == ".mod")
+              available.push_back(lower_copy(entry.path().stem().string()));
+        }
+        options->available_modules = std::move(available);
         if (verbose)
           for (const auto &[category, kind] : options->unsupported_kinds)
             std::cerr << "fxmod-cli: " << command[0] << " lacks "
