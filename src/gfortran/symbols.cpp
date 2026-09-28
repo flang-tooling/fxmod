@@ -167,24 +167,36 @@ std::optional<TypeSpec> parse_typespec(const Node &node) {
   if (!head.is_name())
     return std::nullopt;
   const std::string &base = head.name();
-  if (base == "UNKNOWN")
-    return std::nullopt;
 
   auto second_as_int = [&]() -> std::optional<int> {
     if (l.size() > 1 && l[1].is_int())
       return static_cast<int>(l[1].integer());
     return std::nullopt;
   };
+  // mio_typespec(): type, kind or derived type, interface, ...
+  std::optional<int> interface_ref;
+  if (l.size() > 2 && l[2].is_int() && l[2].integer() != 0)
+    interface_ref = static_cast<int>(l[2].integer());
 
+  if (base == "UNKNOWN") {
+    if (!interface_ref)
+      return std::nullopt;
+    TypeSpec ts; // a procedure(iface) entity, typed by its interface
+    ts.base = base;
+    ts.interface_ref = interface_ref;
+    return ts;
+  }
   if (base == "DERIVED" || base == "CLASS") {
     TypeSpec ts;
     ts.base = "DERIVED";
     ts.derived_ref = second_as_int();
+    ts.interface_ref = interface_ref;
     return ts;
   }
   TypeSpec ts;
   ts.base = base;
   ts.kind = second_as_int();
+  ts.interface_ref = interface_ref;
   return ts;
 }
 
@@ -385,6 +397,11 @@ std::map<int, Symbol> parse_symbols(const Module &module) {
           value_node = *v;
       }
       const Node *array_node = is_parameter ? at(5) : at(4);
+      const Node *result_node = is_parameter ? at(6) : at(5);
+      std::optional<int> result_ref;
+      if (result_node && result_node->is_int() && result_node->integer() != 0 &&
+          result_node->integer() != number)
+        result_ref = static_cast<int>(result_node->integer());
       std::optional<ArraySpec> array_spec;
       if (array_node) {
         try {
@@ -411,6 +428,7 @@ std::map<int, Symbol> parse_symbols(const Module &module) {
       sym.formal_args = std::move(formal_args);
       sym.array_spec = std::move(array_spec);
       sym.ext_attr = ext_attr;
+      sym.result_ref = result_ref;
       symbols[number] = std::move(sym);
 
       i += 6;

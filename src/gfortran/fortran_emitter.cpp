@@ -222,7 +222,9 @@ std::vector<std::string> emit_interface_body(const std::string &public_name,
       throw UnsupportedError("dummy argument symbol " + std::to_string(ref) +
                               " is not in the pool");
     const Symbol &dummy = it->second;
-    if (!dummy.typespec.has_value())
+    // A procedure dummy may be untyped: a subroutine, or one declared by
+    // its interface alone.
+    if (!dummy.typespec.has_value() && dummy.flavor() != "PROCEDURE")
       throw UnsupportedError("dummy argument '" + dummy.name +
                               "' has an unrecoverable type");
     dummies.push_back(&dummy);
@@ -250,18 +252,59 @@ std::vector<std::string> emit_interface_body(const std::string &public_name,
   lines.push_back("    import");
 
   if (sym.is_function()) {
-    std::string decl = sym.typespec->to_fortran(symbols, current_module, uses);
-    if (sym.array_spec)
-      decl += ", dimension" + sym.array_spec->to_fortran(symbols);
+    // The result's attributes sit on the function symbol, or on a result
+    // variable of its own.
+    const Symbol *result = &sym;
+    if (sym.result_ref)
+      if (auto it = symbols.find(*sym.result_ref); it != symbols.end())
+        result = &it->second;
+    const std::optional<TypeSpec> &type =
+        result->typespec ? result->typespec : sym.typespec;
+    std::string decl = type->to_fortran(symbols, current_module, uses);
+    if (result->array_spec)
+      decl += ", dimension" + result->array_spec->to_fortran(symbols);
+    for (const char *attr : {"POINTER", "ALLOCATABLE"})
+      if (has_attr(*result, attr) || has_attr(sym, attr))
+        decl += ", " + lower(attr);
     lines.push_back("    " + decl + " :: " + public_name);
   }
 
   for (const Symbol *d : dummies) {
-    std::string decl = d->typespec->to_fortran(symbols, current_module, uses);
-    if (d->array_spec)
-      decl += ", dimension" + d->array_spec->to_fortran(symbols);
-    if (auto intent = d->intent())
-      decl += ", intent(" + *intent + ")";
+    std::string decl;
+    if (d->flavor() == "PROCEDURE") {
+      // procedure(iface), or an implicit-interface procedure: typed (a
+      // function) or not (a subroutine, or not known to be either).
+      if (d->typespec && d->typespec->interface_ref) {
+        auto iface = symbols.find(*d->typespec->interface_ref);
+        if (iface == symbols.end())
+          throw UnsupportedError("procedure dummy '" + d->name +
+                                  "' has an unknown interface");
+        if (lower(iface->second.module_name) != lower(current_module))
+          record_use(uses, iface->second.module_name, iface->second.name,
+                     iface->second.name);
+        decl = "procedure(" + iface->second.name + ")";
+      } else if (d->typespec) {
+        decl = d->typespec->to_fortran(symbols, current_module, uses) +
+               ", external";
+      } else {
+        decl = "external";
+      }
+      if (has_attr(*d, "PROC_POINTER") || has_attr(*d, "POINTER")) {
+        decl += ", pointer";
+        if (auto intent = d->intent())
+          decl += ", intent(" + *intent + ")";
+      }
+    } else {
+      decl = d->typespec->to_fortran(symbols, current_module, uses);
+      if (d->array_spec)
+        decl += ", dimension" + d->array_spec->to_fortran(symbols);
+      if (auto intent = d->intent())
+        decl += ", intent(" + *intent + ")";
+      for (const char *attr : {"VALUE", "POINTER", "ALLOCATABLE", "TARGET",
+                               "CONTIGUOUS"})
+        if (has_attr(*d, attr))
+          decl += ", " + lower(attr);
+    }
     if (has_attr(*d, "OPTIONAL"))
       decl += ", optional";
     lines.push_back("    " + decl + " :: " + d->name);
@@ -288,7 +331,7 @@ std::vector<std::string> emit_interface(const std::string &public_name,
                                          const std::string &current_module,
                                          NeededUses &uses) {
   std::vector<std::string> lines;
-  lines.push_back("interface");
+  lines.push_back(has_attr(sym, "ABSTRACT") ? "abstract interface" : "interface");
   std::vector<std::string> body =
       emit_interface_body(public_name, sym, symbols, current_module, uses);
   lines.insert(lines.end(), body.begin(), body.end());
@@ -479,6 +522,26 @@ Analysis analyse(const std::map<int, Symbol> &symbols,
     auto it = derived_by_name.find(lower(public_name));
     if (it != derived_by_name.end())
       emit_derived(public_name, *it->second);
+  }
+
+  // Then abstract interfaces: a procedure(iface) declaration anywhere below
+  // may name one, and must come after it.
+  for (const auto &[public_name, number] : symtree) {
+    auto sit = symbols.find(number);
+    if (sit == symbols.end() || derived_by_name.count(lower(public_name)) ||
+        sit->second.flavor() != "PROCEDURE" || !has_attr(sit->second, "ABSTRACT") ||
+        lower(sit->second.module_name) != lower(current_module))
+      continue;
+    try {
+      std::vector<std::string> lines = emit_interface(
+          public_name, sit->second, symbols, current_module, a.uses);
+      a.body.insert(a.body.end(), lines.begin(), lines.end());
+      emitted.insert(number);
+    } catch (const fxmod::Error &exc) {
+      a.problems.push_back("abstract interface '" + public_name + "': " +
+                            exc.what());
+      emitted.insert(number); // reported once, not again below
+    }
   }
 
   for (const auto &[public_name, number] : symtree) {

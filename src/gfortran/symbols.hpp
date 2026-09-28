@@ -72,6 +72,10 @@ struct TypeSpec {
   std::string base; // INTEGER, REAL, LOGICAL, CHARACTER, DERIVED, ...
   std::optional<int> kind;
   std::optional<int> derived_ref;
+  // The interface of a procedure entity declared `procedure(iface)`, by
+  // symbol number: the typespec's third item. A procedure dummy with such
+  // an interface has base "UNKNOWN".
+  std::optional<int> interface_ref;
 
   // Renders as a Fortran type-spec, e.g. "integer(4)" or "type(foo)".
   // `current_module` is the module being emitted: a DERIVED reference to a
@@ -158,6 +162,10 @@ struct Symbol {
   // Symbol numbers of the dummy arguments, in order.
   std::vector<int> formal_args;
   std::optional<ArraySpec> array_spec;
+  // A function's result variable, when declared apart from the function
+  // (`result(r)`): its attributes (pointer, allocatable, dimension) are
+  // the result's.
+  std::optional<int> result_ref;
   // The ext_attr bitmask from the attribute list (!GCC$ ATTRIBUTES), bit
   // numbers per ext_attr_id_t in gfortran.h.
   unsigned ext_attr = 0;
