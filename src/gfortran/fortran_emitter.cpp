@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
 #include <map>
 #include <regex>
 #include <set>
@@ -603,13 +604,42 @@ Analysis analyse(const std::map<int, Symbol> &symbols,
     emitted.insert(sym.number);
   };
 
-  // Derived types first; later declarations may refer to them.
+  // Derived types first; later declarations may refer to them. Among
+  // themselves they go in component order: a type is declared after the
+  // types of its components, which Fortran requires of a component that is
+  // neither pointer nor allocatable -- and those of this module's types a
+  // component refers to are declared even when they are not public.
+  std::map<const Symbol *, std::string> type_names;
   for (const auto &[public_name, number] : symtree) {
     (void)number;
     auto it = derived_by_name.find(lower(public_name));
     if (it != derived_by_name.end())
-      emit_derived(public_name, *it->second);
+      type_names.emplace(it->second, public_name);
   }
+  std::set<const Symbol *> visiting;
+  std::function<void(const Symbol &, const std::string &)> declare_type =
+      [&](const Symbol &type, const std::string &public_name) {
+        if (emitted.count(type.number) || !visiting.insert(&type).second)
+          return; // done, or a cycle through pointer components
+        for (const Component &comp : type.components) {
+          if (!comp.typespec || comp.typespec->base != "DERIVED" ||
+              !comp.typespec->derived_ref || comp.typespec->is_class)
+            continue;
+          auto dep = symbols.find(*comp.typespec->derived_ref);
+          if (dep == symbols.end() || dep->second.flavor() != "DERIVED" ||
+              dep->second.is_artificial() ||
+              lower(dep->second.module_name) != lower(current_module))
+            continue;
+          auto named = type_names.find(&dep->second);
+          declare_type(dep->second, named != type_names.end()
+                                        ? named->second
+                                        : dep->second.name);
+        }
+        emit_derived(public_name, type);
+      };
+  for (const auto &[type, public_name] : type_names)
+    declare_type(*type, public_name);
+
 
   // Then abstract interfaces: a procedure(iface) declaration anywhere below
   // may name one, and must come after it.
