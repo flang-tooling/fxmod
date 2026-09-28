@@ -461,4 +461,79 @@ std::map<std::string, GenericInterface> parse_generic_interfaces(const Module &m
   return out;
 }
 
+std::vector<OperatorInterface> parse_operator_interfaces(const Module &module) {
+  // Source spelling of each gfc_intrinsic_op, in enum order with
+  // INTRINSIC_USER left out, as write_module() does. The old-style
+  // relational block (.eq., .ne., ...), which follows the new-style one,
+  // and the unary forms of + and - share a spelling with their
+  // counterparts, so they land in the same interface.
+  // INTRINSIC_PARENTHESES has no source spelling and never has specifics.
+  static const char *const kIntrinsicOps[] = {
+      "operator(+)",      "operator(-)",     // INTRINSIC_UPLUS, _UMINUS
+      "operator(+)",      "operator(-)",     "operator(*)",
+      "operator(/)",      "operator(**)",    "operator(//)",
+      "operator(.and.)",  "operator(.or.)",  "operator(.eqv.)",
+      "operator(.neqv.)",
+      "operator(==)",     "operator(/=)",    "operator(>)", // INTRINSIC_EQ..LE
+      "operator(>=)",     "operator(<)",     "operator(<=)",
+      "operator(==)",     "operator(/=)",    "operator(>)", // INTRINSIC_EQ_OS..LE_OS
+      "operator(>=)",     "operator(<)",     "operator(<=)",
+      "operator(.not.)",  "assignment(=)",   // INTRINSIC_NOT, _ASSIGN
+      nullptr};                              // INTRINSIC_PARENTHESES
+  constexpr std::size_t kCount = sizeof(kIntrinsicOps) / sizeof(kIntrinsicOps[0]);
+
+  std::vector<OperatorInterface> out;
+  // The two operator sections lead the module body; the symbol pool and
+  // symtree close it (see sections()). A body too short to hold all four
+  // has no operator sections to read.
+  if (module.forest.size() < 4)
+    return out;
+  auto add = [&out](const std::string &spelling, int specific) {
+    auto it = std::find_if(out.begin(), out.end(), [&](const auto &op) {
+      return op.spelling == spelling;
+    });
+    if (it == out.end()) {
+      out.push_back({spelling, {}});
+      it = out.end() - 1;
+    }
+    if (std::find(it->specifics.begin(), it->specifics.end(), specific) ==
+        it->specifics.end())
+      it->specifics.push_back(specific);
+  };
+
+  if (module.forest[0].is_list()) {
+    const List &ops = module.forest[0].list();
+    if (ops.size() != kCount)
+      throw sexpr::FormatError(module.path + ": intrinsic-operator section has " +
+                                std::to_string(ops.size()) + " entries, expected " +
+                                std::to_string(kCount));
+    for (std::size_t i = 0; i < kCount; ++i) {
+      if (!ops[i].is_list())
+        throw sexpr::FormatError(module.path +
+                                  ": malformed intrinsic-operator entry");
+      for (const Node &n : ops[i].list())
+        if (n.is_int()) {
+          if (kIntrinsicOps[i] == nullptr)
+            throw sexpr::FormatError(module.path +
+                                      ": specifics for an operator with no "
+                                      "source spelling");
+          add(kIntrinsicOps[i], static_cast<int>(n.integer()));
+        }
+    }
+  }
+
+  if (module.forest[1].is_list()) {
+    for (const Node &entry : module.forest[1].list()) {
+      if (!entry.is_list() || entry.list().size() < 3 || !entry.list()[0].is_str())
+        continue;
+      const List &e = entry.list();
+      for (std::size_t i = 2; i < e.size(); ++i)
+        if (e[i].is_int())
+          add("operator(." + lower_copy(e[0].str()) + ".)",
+              static_cast<int>(e[i].integer()));
+    }
+  }
+  return out;
+}
+
 } // namespace fxmod::gfortran

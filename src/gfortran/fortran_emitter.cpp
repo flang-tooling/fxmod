@@ -254,26 +254,39 @@ std::vector<std::string> emit_interface(const std::string &public_name,
 // underlying procedure to be a specific of two different generics (real
 // example: OpenACC's `acc_wait` and its deprecated alias
 // `acc_async_wait` both list the same acc_wait_h), but Fortran itself
-// does not allow the same explicit interface to be declared twice. Rather
-// than silently drop the specific from the second generic (changing its
-// overload set) or arbitrarily pick a "winner", the whole second generic
-// is refused.
+// does not allow the same explicit interface to be declared twice. The
+// second generic names it in a `procedure ::` statement instead, which
+// any procedure with an explicit interface may appear in. So does a
+// generic of this module whose specific comes from another module that
+// this module also re-exports by name (`reexported`): the `use` statement
+// doing that provides its interface. Any other foreign specific has its
+// interface inlined like a local one -- its module need not be installed
+// at all (gfortran's openacc.mod takes its specifics from an
+// openacc_internal whose module file it never ships).
+//
+// `public_name` is the generic-spec: a name, or an "operator(...)" /
+// "assignment(=)" spelling for a defined operator.
 std::vector<std::string> emit_generic(const std::string &public_name,
-                                       const GenericInterface &gi,
+                                       const std::vector<int> &specifics,
                                        const std::map<int, Symbol> &symbols,
                                        const std::string &current_module,
                                        NeededUses &uses,
-                                       std::set<int> &specifics_already_declared) {
+                                       std::set<int> &specifics_already_declared,
+                                       const std::set<int> &reexported) {
   // Built up locally and only merged into the shared set once the whole
   // generic succeeds -- a generic that fails partway through (any one
   // specific unsupported) must not "claim" the specifics it did manage to
   // render, or a later, otherwise-fine generic sharing one of them would
   // be wrongly refused as a false duplicate.
   std::vector<int> newly_claimed;
+  NeededUses foreign_uses; // merged into `uses` only on success, as above
 
   std::vector<std::string> lines;
   lines.push_back("interface " + public_name);
-  for (int specific_num : gi.specifics) {
+  std::set<int> in_this_block;
+  for (int specific_num : specifics) {
+    if (!in_this_block.insert(specific_num).second)
+      continue;
     auto it = symbols.find(specific_num);
     if (it == symbols.end())
       throw UnsupportedError("specific procedure symbol " +
@@ -283,12 +296,16 @@ std::vector<std::string> emit_generic(const std::string &public_name,
       throw UnsupportedError("specific procedure '" + it->second.name +
                               "' is an internal compiler-generated symbol "
                               "with no valid Fortran spelling");
-    if (specifics_already_declared.count(specific_num))
-      throw UnsupportedError(
-          "specific procedure '" + it->second.name +
-          "' is already declared under another generic name in this "
-          "module's output -- Fortran doesn't allow the same explicit "
-          "interface twice");
+    if (reexported.count(specific_num)) {
+      record_use(foreign_uses, it->second.module_name, it->second.name,
+                 it->second.name);
+      lines.push_back("  procedure :: " + it->second.name);
+      continue;
+    }
+    if (specifics_already_declared.count(specific_num)) {
+      lines.push_back("  procedure :: " + it->second.name);
+      continue;
+    }
     std::vector<std::string> body = emit_interface_body(
         it->second.name, it->second, symbols, current_module, uses);
     lines.insert(lines.end(), body.begin(), body.end());
@@ -296,6 +313,12 @@ std::vector<std::string> emit_generic(const std::string &public_name,
   }
   lines.push_back("end interface " + public_name);
   specifics_already_declared.insert(newly_claimed.begin(), newly_claimed.end());
+  for (auto &[key, mu] : foreign_uses) {
+    ModuleUse &into = uses[key];
+    into.display_name = mu.display_name;
+    into.intrinsic = mu.intrinsic;
+    into.only_clauses.insert(mu.only_clauses.begin(), mu.only_clauses.end());
+  }
   return lines;
 }
 
@@ -320,6 +343,7 @@ derived_types_by_name(const std::map<int, Symbol> &symbols) {
 Analysis analyse(const std::map<int, Symbol> &symbols,
                   const std::map<std::string, int> &symtree,
                   const std::map<std::string, GenericInterface> &generics,
+                  const std::vector<OperatorInterface> &operators,
                   const std::string &current_module) {
   Analysis a;
   std::set<int> emitted;
@@ -341,6 +365,20 @@ Analysis analyse(const std::map<int, Symbol> &symbols,
     (void)key;
     for (int s : gi.specifics)
       specifics_used_in_generics.insert(s);
+  }
+  for (const OperatorInterface &op : operators)
+    for (int s : op.specifics)
+      specifics_used_in_generics.insert(s);
+  // Public names this module passes on from another one; see the
+  // re-export branch below.
+  std::set<int> reexported;
+  for (const auto &[public_name, number] : symtree) {
+    (void)public_name;
+    auto it = symbols.find(number);
+    if (it != symbols.end() && !it->second.module_name.empty() &&
+        it->second.flavor() != "MODULE" && !it->second.is_artificial() &&
+        lower(it->second.module_name) != lower(current_module))
+      reexported.insert(number);
   }
 
   auto emit_derived = [&](const std::string &public_name, const Symbol &sym) {
@@ -460,8 +498,8 @@ Analysis analyse(const std::map<int, Symbol> &symbols,
       handled_generic_names.insert(key);
       try {
         std::vector<std::string> lines = emit_generic(
-            public_name, git->second, symbols, current_module, a.uses,
-            specifics_already_declared);
+            public_name, git->second.specifics, symbols, current_module,
+            a.uses, specifics_already_declared, reexported);
         a.body.insert(a.body.end(), lines.begin(), lines.end());
         emitted.insert(number);
       } catch (const fxmod::Error &exc) {
@@ -507,11 +545,37 @@ Analysis analyse(const std::map<int, Symbol> &symbols,
     }
     try {
       std::vector<std::string> lines = emit_generic(
-          gi.name, gi, symbols, current_module, a.uses,
-          specifics_already_declared);
+          gi.name, gi.specifics, symbols, current_module, a.uses,
+          specifics_already_declared, reexported);
       a.body.insert(a.body.end(), lines.begin(), lines.end());
     } catch (const fxmod::Error &exc) {
       a.problems.push_back("generic '" + gi.name + "': " + exc.what());
+    }
+  }
+
+  // Defined operators and assignment. The module file records no owner for
+  // these, only their specifics: those defined elsewhere are reached by
+  // using the operator from each specific's own module, the rest get an
+  // interface block of this module's own.
+  for (const OperatorInterface &op : operators) {
+    std::vector<int> local;
+    for (int s : op.specifics) {
+      auto it = symbols.find(s);
+      if (it != symbols.end() && !it->second.module_name.empty() &&
+          lower(it->second.module_name) != lower(current_module))
+        record_use(a.uses, it->second.module_name, op.spelling, op.spelling);
+      else
+        local.push_back(s);
+    }
+    if (local.empty())
+      continue;
+    try {
+      std::vector<std::string> lines =
+          emit_generic(op.spelling, local, symbols, current_module, a.uses,
+                       specifics_already_declared, reexported);
+      a.body.insert(a.body.end(), lines.begin(), lines.end());
+    } catch (const fxmod::Error &exc) {
+      a.problems.push_back(op.spelling + ": " + exc.what());
     }
   }
 
@@ -540,9 +604,10 @@ EmitResult emit_fortran_source(const Module &module, bool strict) {
   if (symtree.empty())
     throw UnsupportedError(module.path + ": no public symbols found");
   std::map<std::string, GenericInterface> generics = parse_generic_interfaces(module);
+  std::vector<OperatorInterface> operators = parse_operator_interfaces(module);
   std::string name = module.name();
 
-  Analysis a = analyse(symbols, symtree, generics, name);
+  Analysis a = analyse(symbols, symtree, generics, operators, name);
   if (!a.problems.empty() && strict) {
     throw UnsupportedError(module.path + ": " +
                             std::to_string(a.problems.size()) +

@@ -209,4 +209,23 @@ struct GenericInterface {
 // preserves whatever case the source used).
 std::map<std::string, GenericInterface> parse_generic_interfaces(const Module &module);
 
+// A defined operator or assignment: `spelling` is the generic-spec as
+// written in source, e.g. "operator(==)", "operator(.cross.)" or
+// "assignment(=)". Intrinsic operators come from the module's first
+// top-level section -- one list of specific symbol numbers per
+// gfc_intrinsic_op, in enum order, INTRINSIC_USER skipped (see
+// write_module() in module.cc) -- and user-defined ones from the second,
+// a flat list of ( '<name>' '<module>' <specific-1> ... ) entries.
+// Operators gfortran keeps apart but Fortran spells alike (== and .eq.,
+// unary and binary +) are merged into one entry, specifics deduplicated.
+struct OperatorInterface {
+  std::string spelling;
+  std::vector<int> specifics;
+};
+
+// Throws sexpr::FormatError when the intrinsic-operator section does not
+// have the verified shape (one list per operator), rather than guessing
+// which operator a list belongs to.
+std::vector<OperatorInterface> parse_operator_interfaces(const Module &module);
+
 } // namespace fxmod::gfortran
