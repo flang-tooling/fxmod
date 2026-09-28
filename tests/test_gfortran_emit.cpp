@@ -55,14 +55,16 @@ int main() {
   // started satisfying those with a `use` statement instead of refusing.
   // openacc.mod's were assumed-type (type(*)) dummies and a specific
   // shared by two generics, closed by emitting type(*) and naming the
-  // second occurrence in a procedure statement.
+  // second occurrence in a procedure statement; ieee_exceptions.mod's
+  // were array constants.
   const char *clean[] = {"omp_lib_kinds.mod", "openacc_kinds.mod",
-                          "ieee_features.mod", "omp_lib.mod", "openacc.mod"};
+                          "ieee_features.mod", "omp_lib.mod", "openacc.mod",
+                          "ieee_exceptions.mod"};
   // The rest of the corpus: real, documented gaps remain (generics,
   // arrays, derived-type constants), so strict emission must refuse --
   // but best-effort must still produce valid Fortran for everything it
   // did translate.
-  const char *partial[] = {"ieee_exceptions.mod", "ieee_arithmetic.mod"};
+  const char *partial[] = {"ieee_arithmetic.mod"};
 
   for (const char *file : clean) {
     std::string path = dir + "/" + file;

@@ -104,11 +104,12 @@ std::optional<std::string> character_literal(const std::string &text) {
 
 // Renders a raw value expression node (see mio_expr() in module.cc) as
 // Fortran text, recursively for a structure constructor's component
-// values. Only two expression kinds are supported: CONSTANT (a scalar
-// literal -- integer, real, complex, logical, or character) and STRUCTURE (a derived-
-// type constant, e.g. a TYPE(foo) PARAMETER initialised to foo(1, 2)).
-// Returns nullopt for anything else (a general expression, an array
-// constructor, ...) so the caller can refuse rather than guess. Deferred
+// values. Three expression kinds are supported: CONSTANT (a scalar
+// literal -- integer, real, complex, logical, or character), STRUCTURE (a
+// derived-type constant, e.g. a TYPE(foo) PARAMETER initialised to
+// foo(1, 2)) and ARRAY (an array constructor of such values). Returns
+// nullopt for anything else (a general expression, an implied-do, ...)
+// so the caller can refuse rather than guess. Deferred
 // to emission time (rather than done once in parse_symbols()) because a
 // structure constructor names its type by symbol number, which may not
 // exist yet in the pool map being built at parse time -- see the
@@ -132,12 +133,16 @@ std::optional<std::string> render_value(const sexpr::Node &node,
       return std::nullopt;
     const sexpr::Node &raw = l[3];
     if (ts->base == "INTEGER") {
-      // gfortran writes the mpz value as a decimal string.
+      // gfortran writes the mpz value as a decimal string. The kind suffix
+      // matters: a default-kind literal cannot hold an integer(8) value
+      // beyond its range.
       static const std::regex kDecimal(R"(-?\d+)");
+      const std::string suffix =
+          ts->kind && *ts->kind != 4 ? "_" + std::to_string(*ts->kind) : "";
       if (raw.is_str() && std::regex_match(raw.str(), kDecimal))
-        return raw.str();
+        return raw.str() + suffix;
       if (raw.is_int())
-        return std::to_string(raw.integer());
+        return std::to_string(raw.integer()) + suffix;
     } else if (ts->base == "LOGICAL") {
       if (raw.is_int())
         return raw.integer() != 0 ? ".true." : ".false.";
@@ -222,7 +227,47 @@ std::optional<std::string> render_value(const sexpr::Node &node,
     return out;
   }
 
-  return std::nullopt; // EXPR_OP, EXPR_FUNCTION, EXPR_ARRAY, ... refused
+  if (kind == "ARRAY") {
+    // (ARRAY <typespec> <rank> ( (<value> <iterator>) ... ) (<shape>...))
+    // -- mio_constructor()/mio_shape(). Only plain element lists are
+    // decoded; implied-do iterators are refused.
+    if (l.size() < 4 || !l[2].is_int() || !l[3].is_list())
+      return std::nullopt;
+    std::vector<std::string> elements;
+    for (const sexpr::Node &entry : l[3].list()) {
+      if (!entry.is_list() || entry.list().empty())
+        return std::nullopt;
+      if (entry.list().size() > 1 && !(entry.list()[1].is_list() &&
+                                       entry.list()[1].list().empty()))
+        return std::nullopt; // an iterator
+      std::optional<std::string> v =
+          render_value(entry.list()[0], symbols, current_module, uses);
+      if (!v)
+        return std::nullopt;
+      elements.push_back(*v);
+    }
+    std::string out = "[";
+    for (std::size_t i = 0; i < elements.size(); ++i)
+      out += (i ? ", " : "") + elements[i];
+    out += "]";
+    const long rank = l[2].integer();
+    if (rank == 1)
+      return out;
+    // Higher rank: the constructor is the elements in array element
+    // order, reshaped to the recorded shape.
+    if (l.size() < 5 || !l[4].is_list() ||
+        l[4].list().size() != static_cast<std::size_t>(rank))
+      return std::nullopt;
+    std::string shape;
+    for (const sexpr::Node &extent : l[4].list()) {
+      if (!extent.is_str())
+        return std::nullopt;
+      shape += (shape.empty() ? "" : ", ") + extent.str();
+    }
+    return "reshape(" + out + ", [" + shape + "])";
+  }
+
+  return std::nullopt; // EXPR_OP, EXPR_FUNCTION, ... refused
 }
 
 // Renders just the "function/subroutine NAME(...) ... end function/
@@ -624,6 +669,8 @@ Analysis analyse(const std::map<int, Symbol> &symbols,
       try {
         std::string decl =
             sym.typespec->to_fortran(symbols, current_module, a.uses);
+        if (sym.array_spec)
+          decl += ", dimension" + sym.array_spec->to_fortran(symbols);
         a.body.push_back(decl + ", parameter :: " + public_name + " = " +
                           *value);
         emitted.insert(number);

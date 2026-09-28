@@ -31,7 +31,7 @@ int main() {
   // driven purely by the symtree -- never counted in the first place.
   const Expected cases[] = {
       {"omp_lib_kinds.mod", 118, 0},   {"openacc_kinds.mod", 20, 0},
-      {"ieee_features.mod", 17, 0},    {"ieee_exceptions.mod", 31, 2},
+      {"ieee_features.mod", 17, 0},    {"ieee_exceptions.mod", 31, 0},
       {"openacc.mod", 28, 0},          {"ieee_arithmetic.mod", 62, 29},
       {"omp_lib.mod", 232, 0},
   };
