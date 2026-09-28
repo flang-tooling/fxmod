@@ -26,3 +26,8 @@ fxmod_add_test(test_wrap)
 target_compile_definitions(test_wrap PRIVATE
   FXMOD_CLI_EXE="$<TARGET_FILE:fxmod-cli>")
 add_dependencies(test_wrap fxmod-cli)
+
+fxmod_add_test(test_wrap_order)
+target_compile_definitions(test_wrap_order PRIVATE
+  FXMOD_CLI_EXE="$<TARGET_FILE:fxmod-cli>")
+add_dependencies(test_wrap_order fxmod-cli)
