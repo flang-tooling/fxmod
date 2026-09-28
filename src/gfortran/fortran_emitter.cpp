@@ -532,6 +532,7 @@ Analysis analyse(const std::map<int, Symbol> &symbols,
   Analysis a;
   std::set<int> emitted;
   std::set<std::string> handled_generic_names;
+  std::vector<int> binding_targets; // type-bound procedures' targets
   std::map<std::string, const Symbol *> derived_by_name =
       derived_types_by_name(symbols);
 
@@ -579,8 +580,27 @@ Analysis analyse(const std::map<int, Symbol> &symbols,
       return;
     }
     std::vector<std::string> lines;
-    lines.push_back("type :: " + public_name);
-    for (const Component &comp : sym.components) {
+    std::string header = "type";
+    if (has_attr(sym, "ABSTRACT"))
+      header += ", abstract";
+    // An extension's parent is its first component, named like the parent
+    // type; declared as the extension it is, not as a component.
+    std::size_t first = 0;
+    if (sym.extension > 0 && !sym.components.empty() &&
+        sym.components[0].typespec && sym.components[0].typespec->derived_ref) {
+      try {
+        std::string parent =
+            sym.components[0].typespec->to_fortran(symbols, current_module, a.uses);
+        header += ", extends(" + parent.substr(5, parent.size() - 6) + ")";
+        first = 1;
+      } catch (const sexpr::FormatError &exc) {
+        a.problems.push_back("type '" + public_name + "': " + exc.what());
+        return;
+      }
+    }
+    lines.push_back(header + " :: " + public_name);
+    for (std::size_t ci = first; ci < sym.components.size(); ++ci) {
+      const Component &comp = sym.components[ci];
       if (comp.is_internal())
         continue; // vtable machinery, no source spelling
       if (!comp.typespec.has_value()) {
@@ -597,6 +617,46 @@ Analysis analyse(const std::map<int, Symbol> &symbols,
         a.problems.push_back("type '" + public_name + "': " +
                               std::string(exc.what()));
         return;
+      }
+    }
+    if (sym.has_typebound_operators) {
+      a.problems.push_back("type '" + public_name +
+                            "': type-bound operators are not translated");
+      return;
+    }
+    if (!sym.bindings.empty()) {
+      lines.push_back("contains");
+      for (const Binding &b : sym.bindings) {
+        std::string attrs = b.is_private ? ", private" : "";
+        if (b.generic) {
+          std::string specifics;
+          for (const std::string &g : b.generic_bindings)
+            specifics += (specifics.empty() ? "" : ", ") + g;
+          lines.push_back("  generic" + attrs + " :: " + b.name + " => " +
+                          specifics);
+          continue;
+        }
+        auto target = symbols.find(b.target);
+        if (target == symbols.end()) {
+          a.problems.push_back("type '" + public_name + "': binding '" + b.name +
+                                "' has an unknown target");
+          return;
+        }
+        attrs += b.nopass ? ", nopass"
+                          : (b.pass_arg.empty() ? "" : ", pass(" + b.pass_arg + ")");
+        if (b.non_overridable)
+          attrs += ", non_overridable";
+        // The target (a deferred binding's: its interface) is declared at
+        // module level, from wherever it comes.
+        binding_targets.push_back(b.target);
+        if (b.deferred)
+          lines.push_back("  procedure(" + target->second.name + "), deferred" +
+                          attrs + " :: " + b.name);
+        else if (lower(target->second.name) == lower(b.name))
+          lines.push_back("  procedure" + attrs + " :: " + b.name);
+        else
+          lines.push_back("  procedure" + attrs + " :: " + b.name + " => " +
+                          target->second.name);
       }
     }
     lines.push_back("end type " + public_name);
@@ -818,6 +878,37 @@ Analysis analyse(const std::map<int, Symbol> &symbols,
       a.body.insert(a.body.end(), lines.begin(), lines.end());
     } catch (const fxmod::Error &exc) {
       a.problems.push_back(op.spelling + ": " + exc.what());
+    }
+  }
+
+  // The procedures type-bound procedures are bound to need interfaces of
+  // their own here. Those not declared by now are not public: declared
+  // private, or use-associated from the module that defines them.
+  std::set<std::string> public_names;
+  for (const auto &[public_name, number] : symtree) {
+    (void)number;
+    public_names.insert(lower(public_name));
+  }
+  for (int target : binding_targets) {
+    auto it = symbols.find(target);
+    if (it == symbols.end() || emitted.count(target) ||
+        specifics_already_declared.count(target))
+      continue;
+    const Symbol &proc = it->second;
+    emitted.insert(target);
+    if (lower(proc.module_name) != lower(current_module)) {
+      record_use(a.uses, proc.module_name, proc.name, proc.name);
+      continue;
+    }
+    if (public_names.count(lower(proc.name)))
+      continue; // declared under its public name above
+    try {
+      std::vector<std::string> lines =
+          emit_interface(proc.name, proc, symbols, current_module, a.uses);
+      a.body.insert(a.body.end(), lines.begin(), lines.end());
+      a.body.push_back("private :: " + proc.name);
+    } catch (const fxmod::Error &exc) {
+      a.problems.push_back("binding target '" + proc.name + "': " + exc.what());
     }
   }
 

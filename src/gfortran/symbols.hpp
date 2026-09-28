@@ -165,6 +165,20 @@ struct ArraySpec {
 // general arithmetic expression) -- refuse rather than guess.
 std::optional<ArraySpec> parse_array_spec(const sexpr::Node &node);
 
+// A type-bound procedure, from the derived type's f2k namespace
+// (mio_typebound_proc() in module.cc).
+struct Binding {
+  std::string name;
+  bool is_private = false;
+  bool deferred = false;
+  bool non_overridable = false;
+  bool nopass = false;
+  std::string pass_arg; // PASS(name); empty for the default first dummy
+  bool generic = false;
+  int target = 0; // the specific's procedure, or a deferred one's interface
+  std::vector<std::string> generic_bindings; // a generic's specific bindings
+};
+
 struct Symbol {
   int number = 0;
   std::string name;
@@ -180,6 +194,12 @@ struct Symbol {
   // Symbol numbers of the dummy arguments, in order.
   std::vector<int> formal_args;
   std::optional<ArraySpec> array_spec;
+  // For a derived type: its extension level (0 unless EXTENDS, whose
+  // parent is then the first component), its type-bound procedures, and
+  // whether it has type-bound operators (not decoded).
+  int extension = 0;
+  std::vector<Binding> bindings;
+  bool has_typebound_operators = false;
   // A function's result variable, when declared apart from the function
   // (`result(r)`): its attributes (pointer, allocatable, dimension) are
   // the result's.

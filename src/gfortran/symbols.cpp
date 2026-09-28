@@ -175,6 +175,53 @@ std::string bound_text(const ArrayBound &b, const std::map<int, Symbol> &symbols
   return "";
 }
 
+// One type-bound procedure: ( '<name>' ( <access> <overridability>
+// <PASS|NOPASS> <SPECIFIC|GENERIC> <PPC|NO_PPC> '<pass-arg>' <pass-arg-num>
+// <target> ) ), the target a symbol number, or for a generic a flat list
+// ( <n> '<specific binding>' ... ).
+std::optional<Binding> parse_binding(const Node &entry) {
+  if (!entry.is_list() || entry.list().size() < 2 || !entry.list()[0].is_str() ||
+      !entry.list()[1].is_list())
+    return std::nullopt;
+  const List &d = entry.list()[1].list();
+  Binding b;
+  b.name = entry.list()[0].str();
+  std::size_t i = 0;
+  for (; i < d.size() && d[i].is_name(); ++i) {
+    const std::string &a = d[i].name();
+    if (a == "PRIVATE")
+      b.is_private = true;
+    else if (a == "DEFERRED")
+      b.deferred = true;
+    else if (a == "NON_OVERRIDABLE")
+      b.non_overridable = true;
+    else if (a == "NOPASS")
+      b.nopass = true;
+    else if (a == "GENERIC")
+      b.generic = true;
+    else if (a == "PPC")
+      return std::nullopt; // a procedure-pointer component, not a binding
+  }
+  if (i < d.size() && d[i].is_str())
+    b.pass_arg = d[i++].str();
+  if (i < d.size() && d[i].is_int())
+    ++i; // the pass argument's position
+  if (i >= d.size())
+    return std::nullopt;
+  if (b.generic) {
+    if (!d[i].is_list())
+      return std::nullopt;
+    for (const Node &g : d[i].list())
+      if (g.is_str())
+        b.generic_bindings.push_back(g.str());
+  } else {
+    if (!d[i].is_int())
+      return std::nullopt;
+    b.target = static_cast<int>(d[i].integer());
+  }
+  return b;
+}
+
 // Returns (symbol pool, symtree): the last two top-level items in the
 // module body, which is more robust than indexing from the front should a
 // future version add a leading section.
@@ -459,6 +506,7 @@ std::map<int, Symbol> parse_symbols(const Module &module) {
       // mio_symbol_attribute(): flavor, intent, proc, if_source, save,
       // ext_attr, extension, then the attribute names.
       unsigned ext_attr = 0;
+      int extension = 0;
       if (!body.empty() && body[0].is_list()) {
         const List &al = body[0].list();
         for (const Node &a : al)
@@ -466,6 +514,8 @@ std::map<int, Symbol> parse_symbols(const Module &module) {
             attrs.push_back(a.name());
         if (al.size() > 5 && al[5].is_int())
           ext_attr = static_cast<unsigned>(al[5].integer());
+        if (al.size() > 6 && al[6].is_int())
+          extension = static_cast<int>(al[6].integer());
       }
 
       const Node *raw_components =
@@ -526,6 +576,22 @@ std::map<int, Symbol> parse_symbols(const Module &module) {
         }
       }
 
+      // A derived type's f2k namespace follows the result reference:
+      // ( <finalizers> <type-bound procedures> <type-bound operators> ... ).
+      std::vector<Binding> bindings;
+      bool has_tb_operators = false;
+      if (contains(attrs, "DERIVED") || (!attrs.empty() && attrs[0] == "DERIVED")) {
+        const Node *f2k = at(6);
+        if (f2k && f2k->is_list() && f2k->list().size() >= 3) {
+          const List &fl = f2k->list();
+          if (fl[1].is_list())
+            for (const Node &entry : fl[1].list())
+              if (auto b = parse_binding(entry))
+                bindings.push_back(std::move(*b));
+          has_tb_operators = fl[2].is_list() && !fl[2].list().empty();
+        }
+      }
+
       Symbol sym;
       sym.number = number;
       sym.name = std::move(name);
@@ -538,6 +604,9 @@ std::map<int, Symbol> parse_symbols(const Module &module) {
       sym.array_spec = std::move(array_spec);
       sym.ext_attr = ext_attr;
       sym.result_ref = result_ref;
+      sym.extension = extension;
+      sym.bindings = std::move(bindings);
+      sym.has_typebound_operators = has_tb_operators;
       symbols[number] = std::move(sym);
 
       i += 6;
