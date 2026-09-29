@@ -14,6 +14,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <fxmod/error.hpp>
@@ -27,6 +28,27 @@ struct EmitResult {
   // family only; always empty for Flang, since its body is source
   // already). Empty means every public symbol made it into `source`.
   std::vector<std::string> problems;
+};
+
+// How emit_fortran_source() translates.
+struct EmitOptions {
+  // Throw UnsupportedError if any public symbol could not be translated,
+  // rather than returning the rest together with the list of problems.
+  bool strict = true;
+  // Intrinsic types the compiler the source is meant for lacks, as
+  // (category, kind): {"REAL", 16} for real(16) (COMPLEX follows REAL).
+  // A generic's specifics using one are left out -- that compiler could
+  // not call them -- and any other symbol using one is a problem. gfortran
+  // modules only; ignored for the other families.
+  std::vector<std::pair<std::string, int>> unsupported_kinds;
+  // The modules the compiler can find, lowercased. A gfortran module file
+  // carries everything it re-exports, so a library may well install it
+  // without the modules it USEs: what comes from one outside this list is
+  // declared from the module's own copy rather than use-associated
+  // (named constants and procedure interfaces; a variable would become a
+  // separate entity and is a problem instead). Unset: every module is
+  // assumed available. Intrinsic modules always are.
+  std::optional<std::vector<std::string>> available_modules;
 };
 
 // A parsed module file. Construct with ModuleFile::open(); the concrete
@@ -64,6 +86,7 @@ public:
   // could not be translated. strict = false: returns the best-effort
   // source together with the list of what was skipped and why.
   EmitResult emit_fortran_source(bool strict = true) const;
+  EmitResult emit_fortran_source(const EmitOptions &options) const;
 
   // Deeper, format-specific structural access than the uniform API above.
   // Only meaningful when family() == Family::Gfortran; throws Error

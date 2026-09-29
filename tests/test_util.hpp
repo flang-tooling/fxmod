@@ -14,6 +14,8 @@
 #include <string>
 #include <vector>
 
+#include <sys/wait.h>
+
 #include <zlib.h>
 
 #define FXMOD_CHECK(cond)                                                   \
@@ -128,4 +130,67 @@ inline std::string which(const std::string &program) {
   while (!out.empty() && (out.back() == '\n' || out.back() == '\r'))
     out.pop_back();
   return out;
+}
+
+// Runs a shell command, returning its exit status and, in `output` if
+// given, everything it wrote to stdout and stderr.
+inline int run_command(const std::string &cmd, std::string *output = nullptr) {
+  FILE *p = popen((cmd + " 2>&1").c_str(), "r");
+  if (!p)
+    return -1;
+  std::string out;
+  char buf[1024];
+  while (std::size_t n = std::fread(buf, 1, sizeof buf, p))
+    out.append(buf, n);
+  int status = pclose(p);
+  if (output)
+    *output = out;
+  return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+// A fresh, empty scratch directory under the system temp dir.
+inline std::filesystem::path fresh_dir(const std::string &name) {
+  std::filesystem::path d = std::filesystem::temp_directory_path() / name;
+  std::error_code ec;
+  std::filesystem::remove_all(d, ec);
+  std::filesystem::create_directories(d);
+  return d;
+}
+
+// Compiles the fixtures/gfortran/<name> sources with gfortran into `dir`,
+// leaving their gfortran-format .mod files there. Skips the test when no
+// gfortran is available.
+inline void gfortran_fixture_modules(const std::filesystem::path &dir,
+                                     const std::vector<std::string> &names,
+                                     const std::string &flags = "") {
+  std::string gfortran = which("gfortran");
+  if (gfortran.empty())
+    skip("no gfortran binary on PATH");
+  for (const std::string &n : names) {
+    std::string out;
+    std::string cmd = "cd " + dir.string() + " && " + gfortran + " " + flags +
+                      " -fsyntax-only " + FXMOD_FIXTURES_DIR "/gfortran/" + n;
+    if (run_command(cmd, &out) != 0) {
+      std::fprintf(stderr, "compiling fixture %s failed:\n%s", n.c_str(),
+                   out.c_str());
+      std::exit(1);
+    }
+  }
+}
+
+// Writes `source` to <dir>/<name> and checks gfortran accepts it,
+// resolving USEs against modules already in `dir`.
+inline void check_gfortran_accepts(const std::filesystem::path &dir,
+                                   const std::string &name,
+                                   const std::string &source,
+                                   const std::string &mode = "-fsyntax-only") {
+  write_file((dir / name).string(), source);
+  std::string out;
+  std::string cmd = "cd " + dir.string() + " && " + which("gfortran") + " " +
+                    mode + " " + name;
+  if (run_command(cmd, &out) != 0) {
+    std::fprintf(stderr, "gfortran rejected %s:\n%s\n--- source ---\n%s",
+                 name.c_str(), out.c_str(), source.c_str());
+    std::exit(1);
+  }
 }

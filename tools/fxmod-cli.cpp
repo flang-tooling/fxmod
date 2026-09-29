@@ -14,12 +14,16 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <map>
 #include <memory>
+#include <optional>
+#include <sstream>
 #include <string>
 #include <vector>
 
+#include <fcntl.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -258,7 +262,8 @@ std::vector<std::string> module_output_flags(fxmod::Family target,
   }
 }
 
-int run_child(const std::vector<std::string> &argv, const std::string &cwd) {
+int run_child(const std::vector<std::string> &argv, const std::string &cwd,
+              bool quiet = false) {
   std::vector<char *> cargv;
   cargv.reserve(argv.size() + 1);
   for (const std::string &a : argv)
@@ -275,6 +280,14 @@ int run_child(const std::vector<std::string> &argv, const std::string &cwd) {
       std::perror("fxmod-cli: chdir");
       _exit(127);
     }
+    if (quiet) {
+      int null_fd = open("/dev/null", O_WRONLY);
+      if (null_fd >= 0) {
+        dup2(null_fd, STDOUT_FILENO);
+        dup2(null_fd, STDERR_FILENO);
+        close(null_fd);
+      }
+    }
     execvp(cargv[0], cargv.data());
     std::perror(("fxmod-cli: exec " + argv[0]).c_str());
     _exit(127);
@@ -287,6 +300,53 @@ int run_child(const std::vector<std::string> &argv, const std::string &cwd) {
   if (WIFEXITED(status))
     return WEXITSTATUS(status);
   return -1;
+}
+
+std::string lower_copy(std::string s) {
+  for (char &c : s)
+    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  return s;
+}
+
+// The modules a translated source USEs, lowercased: the emitter writes each
+// as a `use <name>[, only: ...]` line, intrinsic ones as `use, intrinsic ::`.
+std::vector<std::string> used_modules(const std::string &source) {
+  std::vector<std::string> out;
+  std::istringstream in(source);
+  std::string line;
+  while (std::getline(in, line)) {
+    if (line.rfind("use ", 0) != 0)
+      continue;
+    std::string name = line.substr(4, line.find(',') == std::string::npos
+                                          ? std::string::npos
+                                          : line.find(',') - 4);
+    while (!name.empty() && std::isspace(static_cast<unsigned char>(name.back())))
+      name.pop_back();
+    out.push_back(lower_copy(name));
+  }
+  return out;
+}
+
+// The intrinsic types among those gfortran modules commonly use that the
+// target compiler lacks (Flang on x86-64 has no real(16), for one), found by
+// compiling a declaration of each: an interface using one could only fail
+// to compile there, and is left out instead (see fxmod::EmitOptions).
+std::vector<std::pair<std::string, int>>
+probe_unsupported_kinds(const std::string &compiler, const fs::path &build) {
+  static const std::pair<const char *, int> kCandidates[] = {
+      {"REAL", 10}, {"REAL", 16}, {"INTEGER", 16}};
+  std::vector<std::pair<std::string, int>> out;
+  for (const auto &[category, kind] : kCandidates) {
+    std::string type = lower_copy(category) + "(" + std::to_string(kind) + ")";
+    fs::path src = build / ("fxmod_probe_" + lower_copy(category) +
+                            std::to_string(kind) + ".f90");
+    std::ofstream(src) << "subroutine fxmod_probe\n  " << type
+                       << " :: x\nend subroutine fxmod_probe\n";
+    if (run_child({compiler, "-fsyntax-only", src.string()}, build.string(),
+                  /*quiet=*/true) != 0)
+      out.emplace_back(category, kind);
+  }
+  return out;
 }
 
 std::string cache_dir_for(const std::string &explicit_dir) {
@@ -378,6 +438,19 @@ int run_wrap(const std::vector<std::string> &args) {
   fs::create_directories(build, ec);
 
   int converted = 0, skipped = 0, already = 0;
+
+  // A converted module that USEs another converted module can only compile
+  // once that one's target-format .mod is in the cache. The module files
+  // are therefore all translated first, and compiled afterwards in
+  // dependency order, which is read off the `use` lines of the translated
+  // source (the only place a module's dependencies are spelled out).
+  struct Pending {
+    fs::path mod_path, src_path, stamp, out_mod;
+    std::string stem;
+    std::vector<std::string> uses; // lowercased module names
+  };
+  std::vector<Pending> pending;
+  std::optional<fxmod::EmitOptions> options; // probed on first need
   for (const std::string &dir_str : dirs) {
     fs::path dir(dir_str);
     if (!fs::is_directory(dir))
@@ -409,9 +482,33 @@ int run_wrap(const std::vector<std::string> &args) {
         continue;
       }
 
+      if (!options) {
+        options.emplace();
+        options->strict = !best_effort;
+        options->unsupported_kinds = probe_unsupported_kinds(command[0], build);
+        // What a translation's `use` statements can find: every module
+        // file on the search path or already converted into the cache.
+        std::vector<std::string> available;
+        std::vector<std::string> scan = dirs;
+        scan.push_back(cache.string());
+        for (const std::string &d : scan) {
+          if (!fs::is_directory(d))
+            continue;
+          for (const auto &entry : fs::directory_iterator(d, ec))
+            if (entry.path().extension() == ".mod")
+              available.push_back(lower_copy(entry.path().stem().string()));
+        }
+        options->available_modules = std::move(available);
+        if (verbose)
+          for (const auto &[category, kind] : options->unsupported_kinds)
+            std::cerr << "fxmod-cli: " << command[0] << " lacks "
+                      << lower_copy(category) << "(" << kind
+                      << "); leaving out interfaces that use it\n";
+      }
+
       fxmod::EmitResult r;
       try {
-        r = mf->emit_fortran_source(/*strict=*/!best_effort);
+        r = mf->emit_fortran_source(*options);
       } catch (const std::exception &e) {
         if (verbose)
           std::cerr << "fxmod-cli: skipping " << mod_path << ": " << e.what()
@@ -428,54 +525,81 @@ int run_wrap(const std::vector<std::string> &args) {
         std::ofstream out(src_path, std::ios::binary);
         out << r.source;
       }
-
-      std::vector<std::string> cc = {command[0]};
-      std::vector<std::string> out_flags = module_output_flags(target, cache.string());
-      cc.insert(cc.end(), out_flags.begin(), out_flags.end());
-      cc.push_back("-I" + cache.string());
-      for (const std::string &d : dirs)
-        cc.push_back("-I" + d);
-      cc.push_back("-c");
-      cc.push_back(fs::absolute(src_path).string());
-
-      if (dry_run) {
-        if (verbose) {
-          std::cerr << "fxmod-cli: [dry-run] would run:";
-          for (const auto &a : cc)
-            std::cerr << " " << a;
-          std::cerr << "\n";
-        }
-        continue;
-      }
-
-      int status = run_child(cc, build.string());
-      if (status != 0) {
-        std::cerr << "fxmod-cli: " << command[0]
-                   << " failed to compile converted module '" << stem
-                   << "' (exit " << status << "), leaving original in place\n";
-        ++skipped;
-        continue;
-      }
-      if (!fs::exists(out_mod)) {
-        std::cerr << "fxmod-cli: converting '" << stem
-                   << "' compiled cleanly but did not produce " << out_mod
-                   << " -- check module_output_flags() for this target\n";
-        ++skipped;
-        continue;
-      }
-
-      for (const auto &entry : fs::directory_iterator(cache, ec)) {
-        std::string name = entry.path().filename().string();
-        if (name.rfind("." + stem + ".", 0) == 0 &&
-            name.size() > 7 && name.substr(name.size() - 6) == ".stamp")
-          fs::remove(entry.path(), ec);
-      }
-      std::ofstream(stamp).close();
-      ++converted;
-      if (verbose)
-        std::cerr << "fxmod-cli: converted " << mod_path << " -> " << out_mod
-                   << "\n";
+      pending.push_back({mod_path, src_path, stamp, out_mod, stem,
+                         used_modules(r.source)});
     }
+  }
+
+  // Depth-first, dependencies before dependents; a dependency outside this
+  // run (already cached, or not converted at all) imposes no order.
+  std::map<std::string, std::size_t> by_name;
+  for (std::size_t k = 0; k < pending.size(); ++k)
+    by_name.emplace(lower_copy(pending[k].stem), k);
+  std::vector<std::size_t> order;
+  std::vector<int> state(pending.size(), 0); // 0 new, 1 visiting, 2 done
+  std::function<void(std::size_t)> visit = [&](std::size_t k) {
+    if (state[k] != 0)
+      return; // done, or a cycle -- which cannot compile in any order
+    state[k] = 1;
+    for (const std::string &dep : pending[k].uses) {
+      auto it = by_name.find(dep);
+      if (it != by_name.end())
+        visit(it->second);
+    }
+    state[k] = 2;
+    order.push_back(k);
+  };
+  for (std::size_t k = 0; k < pending.size(); ++k)
+    visit(k);
+
+  for (std::size_t k : order) {
+    const Pending &p = pending[k];
+    std::vector<std::string> cc = {command[0]};
+    std::vector<std::string> out_flags = module_output_flags(target, cache.string());
+    cc.insert(cc.end(), out_flags.begin(), out_flags.end());
+    cc.push_back("-I" + cache.string());
+    for (const std::string &d : dirs)
+      cc.push_back("-I" + d);
+    cc.push_back("-c");
+    cc.push_back(fs::absolute(p.src_path).string());
+
+    if (dry_run) {
+      if (verbose) {
+        std::cerr << "fxmod-cli: [dry-run] would run:";
+        for (const auto &a : cc)
+          std::cerr << " " << a;
+        std::cerr << "\n";
+      }
+      continue;
+    }
+
+    int status = run_child(cc, build.string());
+    if (status != 0) {
+      std::cerr << "fxmod-cli: " << command[0]
+                 << " failed to compile converted module '" << p.stem
+                 << "' (exit " << status << "), leaving original in place\n";
+      ++skipped;
+      continue;
+    }
+    if (!fs::exists(p.out_mod)) {
+      std::cerr << "fxmod-cli: converting '" << p.stem
+                 << "' compiled cleanly but did not produce " << p.out_mod
+                 << " -- check module_output_flags() for this target\n";
+      ++skipped;
+      continue;
+    }
+
+    for (const auto &entry : fs::directory_iterator(cache, ec)) {
+      std::string name = entry.path().filename().string();
+      if (name.rfind("." + p.stem + ".", 0) == 0 &&
+          name.size() > 7 && name.substr(name.size() - 6) == ".stamp")
+        fs::remove(entry.path(), ec);
+    }
+    std::ofstream(p.stamp).close();
+    ++converted;
+    if (verbose)
+      std::cerr << "fxmod-cli: converted " << p.mod_path << " -> " << p.out_mod
+                 << "\n";
   }
 
   if (verbose)

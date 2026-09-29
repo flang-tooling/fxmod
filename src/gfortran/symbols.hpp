@@ -47,11 +47,12 @@ struct ModuleUse {
 };
 using NeededUses = std::map<std::string, ModuleUse>;
 
-// gfortran spells every intrinsic module (ISO_C_BINDING,
-// ISO_FORTRAN_ENV, IEEE_ARITHMETIC, ...) internally with a leading "__"
-// -- a real `use __iso_c_binding` doesn't compile, so that prefix is
-// stripped and the result marked `intrinsic`. Anything else is a plain
-// external module, used exactly as spelled.
+// gfortran spells most intrinsic modules (ISO_C_BINDING, ISO_FORTRAN_ENV,
+// ...) internally with a leading "__" -- a real `use __iso_c_binding`
+// doesn't compile, so that prefix is stripped and the result marked
+// `intrinsic`. The IEEE modules it spells plainly, so those are
+// recognised by name. Anything else is a plain external module, used
+// exactly as spelled.
 struct ResolvedModuleName {
   std::string name;
   bool intrinsic = false;
@@ -67,10 +68,40 @@ ResolvedModuleName resolve_module_name(const std::string &module_name);
 void record_use(NeededUses &uses, const std::string &module_name,
                  const std::string &real_name, const std::string &local_name);
 
+// One dimension's bounds, from mio_array_spec()'s per-dimension mio_expr()
+// calls. A bound is either absent (assumed-shape's/deferred's upper bound,
+// or a defaulted lower bound), a compile-time constant (rendered
+// immediately -- constants never reference another symbol, so there's no
+// forward-reference concern), or a reference to another symbol by number
+// (typically a dummy argument used as an extent, e.g. `x(n)`) -- kept as
+// a number and resolved to a name only at emission time.
+struct ArrayBound {
+  enum class Kind { Absent, Constant, SymbolRef };
+  Kind kind = Kind::Absent;
+  std::string constant_text; // valid when kind == Constant
+  int symbol_ref = 0;        // valid when kind == SymbolRef
+  // For a SymbolRef: a component path below the symbol (`self%n`), as
+  // (derived-type symbol, component id) pairs from the reference list.
+  std::vector<std::pair<int, int>> components;
+};
+
 struct TypeSpec {
   std::string base; // INTEGER, REAL, LOGICAL, CHARACTER, DERIVED, ...
   std::optional<int> kind;
   std::optional<int> derived_ref;
+  // CLASS(...) rather than TYPE(...): `derived_ref` then names gfortran's
+  // internal __class_* container, whose _data component carries the
+  // declared type.
+  bool is_class = false;
+  // The interface of a procedure entity declared `procedure(iface)`, by
+  // symbol number: the typespec's third item. A procedure dummy with such
+  // an interface has base "UNKNOWN".
+  std::optional<int> interface_ref;
+  // CHARACTER length: a constant or a symbol (`len=n`), assumed (`len=*`),
+  // deferred (`len=:`), or not decoded (unset, rendered without a length).
+  enum class CharLen { None, Bound, Assumed, Deferred };
+  CharLen char_len = CharLen::None;
+  ArrayBound char_len_bound; // valid when char_len == Bound
 
   // Renders as a Fortran type-spec, e.g. "integer(4)" or "type(foo)".
   // `current_module` is the module being emitted: a DERIVED reference to a
@@ -93,7 +124,13 @@ struct TypeSpec {
 // into a refusal.
 std::optional<TypeSpec> parse_typespec(const sexpr::Node &node);
 
+// For a CLASS(...) typespec: the pointer/allocatable attribute of the
+// entity, which gfortran encodes in the name of its __class_* container
+// rather than on the entity ("pointer", "allocatable" or "").
+std::string class_attribute(const TypeSpec &ts, const std::map<int, Symbol> &symbols);
+
 struct Component {
+  int id = 0; // the number a COMPONENT reference names it by
   std::string name;
   // Unset when the type could not be interpreted; only fatal if the
   // containing type actually has to be emitted.
@@ -102,20 +139,6 @@ struct Component {
   // gfortran vtable machinery: _copy, _vptr, _hash, _size, ... has no
   // source spelling and is never emitted.
   bool is_internal() const { return !name.empty() && name.front() == '_'; }
-};
-
-// One dimension's bounds, from mio_array_spec()'s per-dimension mio_expr()
-// calls. A bound is either absent (assumed-shape's/deferred's upper bound,
-// or a defaulted lower bound), a compile-time constant (rendered
-// immediately -- constants never reference another symbol, so there's no
-// forward-reference concern), or a reference to another symbol by number
-// (typically a dummy argument used as an extent, e.g. `x(n)`) -- kept as
-// a number and resolved to a name only at emission time.
-struct ArrayBound {
-  enum class Kind { Absent, Constant, SymbolRef };
-  Kind kind = Kind::Absent;
-  std::string constant_text; // valid when kind == Constant
-  int symbol_ref = 0;        // valid when kind == SymbolRef
 };
 
 struct ArraySpec {
@@ -142,6 +165,20 @@ struct ArraySpec {
 // general arithmetic expression) -- refuse rather than guess.
 std::optional<ArraySpec> parse_array_spec(const sexpr::Node &node);
 
+// A type-bound procedure, from the derived type's f2k namespace
+// (mio_typebound_proc() in module.cc).
+struct Binding {
+  std::string name;
+  bool is_private = false;
+  bool deferred = false;
+  bool non_overridable = false;
+  bool nopass = false;
+  std::string pass_arg; // PASS(name); empty for the default first dummy
+  bool generic = false;
+  int target = 0; // the specific's procedure, or a deferred one's interface
+  std::vector<std::string> generic_bindings; // a generic's specific bindings
+};
+
 struct Symbol {
   int number = 0;
   std::string name;
@@ -157,6 +194,20 @@ struct Symbol {
   // Symbol numbers of the dummy arguments, in order.
   std::vector<int> formal_args;
   std::optional<ArraySpec> array_spec;
+  // For a derived type: its extension level (0 unless EXTENDS, whose
+  // parent is then the first component), its type-bound procedures, and
+  // whether it has type-bound operators (not decoded).
+  int extension = 0;
+  std::vector<Binding> bindings;
+  bool has_typebound_operators = false;
+  // A function's result variable, when declared apart from the function
+  // (`result(r)`): its attributes (pointer, allocatable, dimension) are
+  // the result's.
+  std::optional<int> result_ref;
+  // The ext_attr bitmask from the attribute list (!GCC$ ATTRIBUTES), bit
+  // numbers per ext_attr_id_t in gfortran.h.
+  unsigned ext_attr = 0;
+  static constexpr unsigned kExtAttrNoArgCheck = 1u << 5;
 
   // Fortran intent clause for a dummy argument, if it has one. Attribute
   // slot 1 is IN / OUT / INOUT / UNKNOWN-INTENT when DUMMY is set.
@@ -198,11 +249,33 @@ std::map<std::string, int> parse_symtree(const Module &module);
 // is_generic() symbol's name as a real user generic.
 struct GenericInterface {
   std::string name; // as spelled in the module, for rendering
+  // The module that defines the generic: a module re-exporting a generic
+  // it USEs lists it here too, under the defining module's name.
+  std::string module;
   std::vector<int> specifics;
 };
 
 // Keyed by lowercased name (Fortran is case-insensitive; the module file
 // preserves whatever case the source used).
 std::map<std::string, GenericInterface> parse_generic_interfaces(const Module &module);
+
+// A defined operator or assignment: `spelling` is the generic-spec as
+// written in source, e.g. "operator(==)", "operator(.cross.)" or
+// "assignment(=)". Intrinsic operators come from the module's first
+// top-level section -- one list of specific symbol numbers per
+// gfc_intrinsic_op, in enum order, INTRINSIC_USER skipped (see
+// write_module() in module.cc) -- and user-defined ones from the second,
+// a flat list of ( '<name>' '<module>' <specific-1> ... ) entries.
+// Operators gfortran keeps apart but Fortran spells alike (== and .eq.,
+// unary and binary +) are merged into one entry, specifics deduplicated.
+struct OperatorInterface {
+  std::string spelling;
+  std::vector<int> specifics;
+};
+
+// Throws sexpr::FormatError when the intrinsic-operator section does not
+// have the verified shape (one list per operator), rather than guessing
+// which operator a list belongs to.
+std::vector<OperatorInterface> parse_operator_interfaces(const Module &module);
 
 } // namespace fxmod::gfortran

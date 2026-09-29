@@ -1,6 +1,11 @@
 #include "fortran_emitter.hpp"
 
 #include <algorithm>
+#include <cerrno>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <functional>
 #include <map>
 #include <regex>
 #include <set>
@@ -10,6 +15,13 @@
 namespace fxmod::gfortran {
 
 namespace {
+
+// Modules every compiler ships its own version of, with differing
+// contents: a re-export names only what gfortran's has, which the target
+// compiler's may lack. They are used whole instead (renames excepted), and
+// are available wherever the compiler is.
+const std::set<std::string> kCompilerSupplied = {"omp_lib", "omp_lib_kinds",
+                                                 "openacc", "openacc_kinds"};
 
 struct Analysis {
   std::vector<std::string> body;
@@ -28,13 +40,114 @@ std::string lower(const std::string &s) {
   return out;
 }
 
+// The first type `ts` spells that the target lacks, e.g. "real(16)".
+std::optional<std::string> unsupported_type(const std::optional<TypeSpec> &ts,
+                                            const UnsupportedKinds &kinds) {
+  if (!ts || !ts->kind)
+    return std::nullopt;
+  const std::string category = ts->base == "COMPLEX" ? "REAL" : ts->base;
+  for (const auto &[base, kind] : kinds)
+    if (base == category && kind == *ts->kind)
+      return lower(ts->base) + "(" + std::to_string(kind) + ")";
+  return std::nullopt;
+}
+
+// Same for a symbol: its own type (a function's result), and a
+// procedure's dummy arguments.
+std::optional<std::string> unsupported_type(const Symbol &sym,
+                                            const std::map<int, Symbol> &symbols,
+                                            const UnsupportedKinds &kinds) {
+  if (kinds.empty())
+    return std::nullopt;
+  if (auto t = unsupported_type(sym.typespec, kinds))
+    return t;
+  for (int ref : sym.formal_args) {
+    auto it = symbols.find(ref);
+    if (it != symbols.end())
+      if (auto t = unsupported_type(it->second.typespec, kinds))
+        return t;
+  }
+  return std::nullopt;
+}
+
+// A REAL constant's value as gfortran writes it: mpfr_get_str() in base 16
+// (mio_gmp_real() in module.cc), i.e. an optional sign, "0.", hexadecimal
+// mantissa digits, then "@" and the power of 16 in decimal -- "-0.199999a@0"
+// is -0x0.199999a, "0.78@31" is 0x0.78 * 16^31. Rendered as a decimal
+// literal with enough digits to round-trip at `kind` (the value is exactly
+// representable there, having been rounded to it by gfortran), kind
+// suffix included. Kinds without a C++ double to carry them (10, 16) and
+// the non-finite spellings are refused.
+std::optional<std::string> real_literal(const std::string &text, int kind) {
+  static const std::regex kMpfr(R"((-?)0\.([0-9a-f]+)@(-?\d+))");
+  std::smatch m;
+  if ((kind != 4 && kind != 8) || !std::regex_match(text, m, kMpfr))
+    return std::nullopt;
+  // The same number as a C99 hexadecimal float: each hex digit is 4 bits.
+  const long exponent = std::stol(m[3].str()) * 4;
+  const std::string hex = m[1].str() + "0x0." + m[2].str() + "p" +
+                           std::to_string(exponent);
+  errno = 0;
+  const double value = std::strtod(hex.c_str(), nullptr);
+  if (errno != 0 || !std::isfinite(value))
+    return std::nullopt;
+  char buf[64];
+  std::snprintf(buf, sizeof buf, kind == 4 ? "%.9g" : "%.17g", value);
+  std::string out = buf;
+  if (out.find_first_of(".e") == std::string::npos)
+    out += ".0"; // "42" would be an INTEGER literal
+  return out + "_" + std::to_string(kind);
+}
+
+// A character constant's value, from gfortran's escaped spelling, as a
+// Fortran expression: printable runs quoted, anything else as achar().
+std::optional<std::string> character_literal(const std::string &text) {
+  std::vector<std::string> parts;
+  std::string run;
+  auto flush = [&]() {
+    if (!run.empty())
+      parts.push_back("'" + run + "'");
+    run.clear();
+  };
+  for (std::size_t i = 0; i < text.size(); ++i) {
+    unsigned code;
+    if (text[i] == '\\' && i + 1 < text.size() && text[i + 1] == '\\') {
+      code = '\\';
+      ++i;
+    } else if (text[i] == '\\' && i + 9 < text.size() && text[i + 1] == 'U') {
+      code = static_cast<unsigned>(std::stoul(text.substr(i + 2, 8), nullptr, 16));
+      i += 9;
+    } else {
+      code = static_cast<unsigned char>(text[i]);
+    }
+    if (code > 255)
+      return std::nullopt; // not a kind=1 character
+    if (code >= 0x20 && code < 0x7f) {
+      run += static_cast<char>(code);
+      if (code == '\'')
+        run += '\''; // doubled inside a quoted run
+    } else {
+      flush();
+      parts.push_back("achar(" + std::to_string(code) + ")");
+    }
+  }
+  flush();
+  if (parts.empty())
+    return "''";
+  std::string out;
+  for (std::size_t i = 0; i < parts.size(); ++i)
+    out += (i ? "//" : "") + parts[i];
+  return out;
+}
+
 // Renders a raw value expression node (see mio_expr() in module.cc) as
 // Fortran text, recursively for a structure constructor's component
-// values. Only two expression kinds are supported: CONSTANT (a scalar
-// literal -- integer, logical, or character) and STRUCTURE (a derived-
-// type constant, e.g. a TYPE(foo) PARAMETER initialised to foo(1, 2)).
-// Returns nullopt for anything else (a general expression, an array
-// constructor, ...) so the caller can refuse rather than guess. Deferred
+// values. Three expression kinds are supported: CONSTANT (a scalar
+// literal -- integer, real, complex, logical, or character), STRUCTURE (a
+// derived-type constant, e.g. a TYPE(foo) PARAMETER initialised to
+// foo(1, 2)) and ARRAY (an array constructor of such values). Returns
+// nullopt for anything else (a general expression, an implied-do, ...)
+// so the caller can refuse rather than guess. Deferred
 // to emission time (rather than done once in parse_symbols()) because a
 // structure constructor names its type by symbol number, which may not
 // exist yet in the pool map being built at parse time -- see the
@@ -58,28 +171,38 @@ std::optional<std::string> render_value(const sexpr::Node &node,
       return std::nullopt;
     const sexpr::Node &raw = l[3];
     if (ts->base == "INTEGER") {
-      // gfortran writes the mpz value as a decimal string.
+      // gfortran writes the mpz value as a decimal string. The kind suffix
+      // matters: a default-kind literal cannot hold an integer(8) value
+      // beyond its range.
       static const std::regex kDecimal(R"(-?\d+)");
+      const std::string suffix =
+          ts->kind && *ts->kind != 4 ? "_" + std::to_string(*ts->kind) : "";
       if (raw.is_str() && std::regex_match(raw.str(), kDecimal))
-        return raw.str();
+        return raw.str() + suffix;
       if (raw.is_int())
-        return std::to_string(raw.integer());
+        return std::to_string(raw.integer()) + suffix;
     } else if (ts->base == "LOGICAL") {
       if (raw.is_int())
         return raw.integer() != 0 ? ".true." : ".false.";
       if (raw.is_str() && (raw.str() == "0" || raw.str() == "1"))
         return raw.str() == "1" ? ".true." : ".false.";
-    } else if (ts->base == "CHARACTER") {
-      if (raw.is_str()) {
-        std::string escaped;
-        for (char c : raw.str()) {
-          if (c == '\'')
-            escaped += "''";
-          else
-            escaped += c;
-        }
-        return "'" + escaped + "'";
+    } else if (ts->base == "REAL" && ts->kind) {
+      if (raw.is_str())
+        return real_literal(raw.str(), *ts->kind);
+    } else if (ts->base == "COMPLEX" && ts->kind) {
+      // Real and imaginary part, each written like a REAL constant.
+      if (raw.is_str() && l.size() > 4 && l[4].is_str()) {
+        std::optional<std::string> re = real_literal(raw.str(), *ts->kind);
+        std::optional<std::string> im = real_literal(l[4].str(), *ts->kind);
+        if (re && im)
+          return "(" + *re + ", " + *im + ")";
       }
+    } else if (ts->base == "CHARACTER") {
+      // (CONSTANT <ts> <rank> <length> '<string>'), the string with
+      // gfortran's escapes (quote_string() in module.cc): \\ for a
+      // backslash, \Uxxxxxxxx for any character that is not printable.
+      if (l.size() > 4 && l[4].is_str())
+        return character_literal(l[4].str());
     }
     return std::nullopt;
   }
@@ -142,7 +265,47 @@ std::optional<std::string> render_value(const sexpr::Node &node,
     return out;
   }
 
-  return std::nullopt; // EXPR_OP, EXPR_FUNCTION, EXPR_ARRAY, ... refused
+  if (kind == "ARRAY") {
+    // (ARRAY <typespec> <rank> ( (<value> <iterator>) ... ) (<shape>...))
+    // -- mio_constructor()/mio_shape(). Only plain element lists are
+    // decoded; implied-do iterators are refused.
+    if (l.size() < 4 || !l[2].is_int() || !l[3].is_list())
+      return std::nullopt;
+    std::vector<std::string> elements;
+    for (const sexpr::Node &entry : l[3].list()) {
+      if (!entry.is_list() || entry.list().empty())
+        return std::nullopt;
+      if (entry.list().size() > 1 && !(entry.list()[1].is_list() &&
+                                       entry.list()[1].list().empty()))
+        return std::nullopt; // an iterator
+      std::optional<std::string> v =
+          render_value(entry.list()[0], symbols, current_module, uses);
+      if (!v)
+        return std::nullopt;
+      elements.push_back(*v);
+    }
+    std::string out = "[";
+    for (std::size_t i = 0; i < elements.size(); ++i)
+      out += (i ? ", " : "") + elements[i];
+    out += "]";
+    const long rank = l[2].integer();
+    if (rank == 1)
+      return out;
+    // Higher rank: the constructor is the elements in array element
+    // order, reshaped to the recorded shape.
+    if (l.size() < 5 || !l[4].is_list() ||
+        l[4].list().size() != static_cast<std::size_t>(rank))
+      return std::nullopt;
+    std::string shape;
+    for (const sexpr::Node &extent : l[4].list()) {
+      if (!extent.is_str())
+        return std::nullopt;
+      shape += (shape.empty() ? "" : ", ") + extent.str();
+    }
+    return "reshape(" + out + ", [" + shape + "])";
+  }
+
+  return std::nullopt; // EXPR_OP, EXPR_FUNCTION, ... refused
 }
 
 // Renders just the "function/subroutine NAME(...) ... end function/
@@ -178,7 +341,9 @@ std::vector<std::string> emit_interface_body(const std::string &public_name,
       throw UnsupportedError("dummy argument symbol " + std::to_string(ref) +
                               " is not in the pool");
     const Symbol &dummy = it->second;
-    if (!dummy.typespec.has_value())
+    // A procedure dummy may be untyped: a subroutine, or one declared by
+    // its interface alone.
+    if (!dummy.typespec.has_value() && dummy.flavor() != "PROCEDURE")
       throw UnsupportedError("dummy argument '" + dummy.name +
                               "' has an unrecoverable type");
     dummies.push_back(&dummy);
@@ -206,22 +371,78 @@ std::vector<std::string> emit_interface_body(const std::string &public_name,
   lines.push_back("    import");
 
   if (sym.is_function()) {
-    std::string decl = sym.typespec->to_fortran(symbols, current_module, uses);
-    if (sym.array_spec)
-      decl += ", dimension" + sym.array_spec->to_fortran(symbols);
+    // The result's attributes sit on the function symbol, or on a result
+    // variable of its own.
+    const Symbol *result = &sym;
+    if (sym.result_ref)
+      if (auto it = symbols.find(*sym.result_ref); it != symbols.end())
+        result = &it->second;
+    const std::optional<TypeSpec> &type =
+        result->typespec ? result->typespec : sym.typespec;
+    std::string decl = type->to_fortran(symbols, current_module, uses);
+    if (result->array_spec)
+      decl += ", dimension" + result->array_spec->to_fortran(symbols);
+    for (const char *attr : {"POINTER", "ALLOCATABLE"})
+      if (has_attr(*result, attr) || has_attr(sym, attr))
+        decl += ", " + lower(attr);
+    if (std::string ca = class_attribute(*type, symbols); !ca.empty() &&
+        decl.find(", " + ca) == std::string::npos)
+      decl += ", " + ca;
     lines.push_back("    " + decl + " :: " + public_name);
   }
 
   for (const Symbol *d : dummies) {
-    std::string decl = d->typespec->to_fortran(symbols, current_module, uses);
-    if (d->array_spec)
-      decl += ", dimension" + d->array_spec->to_fortran(symbols);
-    if (auto intent = d->intent())
-      decl += ", intent(" + *intent + ")";
+    std::string decl;
+    if (d->flavor() == "PROCEDURE") {
+      // procedure(iface), or an implicit-interface procedure: typed (a
+      // function) or not (a subroutine, or not known to be either).
+      if (d->typespec && d->typespec->interface_ref) {
+        auto iface = symbols.find(*d->typespec->interface_ref);
+        if (iface == symbols.end())
+          throw UnsupportedError("procedure dummy '" + d->name +
+                                  "' has an unknown interface");
+        if (lower(iface->second.module_name) != lower(current_module))
+          record_use(uses, iface->second.module_name, iface->second.name,
+                     iface->second.name);
+        decl = "procedure(" + iface->second.name + ")";
+      } else if (d->typespec) {
+        decl = d->typespec->to_fortran(symbols, current_module, uses) +
+               ", external";
+      } else {
+        decl = "external";
+      }
+      if (has_attr(*d, "PROC_POINTER") || has_attr(*d, "POINTER")) {
+        decl += ", pointer";
+        if (auto intent = d->intent())
+          decl += ", intent(" + *intent + ")";
+      }
+    } else {
+      decl = d->typespec->to_fortran(symbols, current_module, uses);
+      if (d->array_spec)
+        decl += ", dimension" + d->array_spec->to_fortran(symbols);
+      if (auto intent = d->intent())
+        decl += ", intent(" + *intent + ")";
+      for (const char *attr : {"VALUE", "POINTER", "ALLOCATABLE", "TARGET",
+                               "CONTIGUOUS"})
+        if (has_attr(*d, attr))
+          decl += ", " + lower(attr);
+      if (std::string ca = class_attribute(*d->typespec, symbols); !ca.empty() &&
+          decl.find(", " + ca) == std::string::npos)
+        decl += ", " + ca;
+    }
     if (has_attr(*d, "OPTIONAL"))
       decl += ", optional";
     lines.push_back("    " + decl + " :: " + d->name);
   }
+  // gfortran's NO_ARG_CHECK (type, kind and rank of the actual go
+  // unchecked, e.g. MPI and OpenACC choice buffers) in both compilers'
+  // spellings -- each ignores the other's directive. Without it a generic
+  // over such specifics can be ambiguous by the standard's rules.
+  for (const Symbol *d : dummies)
+    if (d->ext_attr & Symbol::kExtAttrNoArgCheck) {
+      lines.push_back("    !GCC$ ATTRIBUTES NO_ARG_CHECK :: " + d->name);
+      lines.push_back("    !DIR$ IGNORE_TKR (tkr) " + d->name);
+    }
 
   lines.push_back(std::string("  end ") + kind + " " + public_name);
   return lines;
@@ -235,7 +456,7 @@ std::vector<std::string> emit_interface(const std::string &public_name,
                                          const std::string &current_module,
                                          NeededUses &uses) {
   std::vector<std::string> lines;
-  lines.push_back("interface");
+  lines.push_back(has_attr(sym, "ABSTRACT") ? "abstract interface" : "interface");
   std::vector<std::string> body =
       emit_interface_body(public_name, sym, symbols, current_module, uses);
   lines.insert(lines.end(), body.begin(), body.end());
@@ -254,26 +475,40 @@ std::vector<std::string> emit_interface(const std::string &public_name,
 // underlying procedure to be a specific of two different generics (real
 // example: OpenACC's `acc_wait` and its deprecated alias
 // `acc_async_wait` both list the same acc_wait_h), but Fortran itself
-// does not allow the same explicit interface to be declared twice. Rather
-// than silently drop the specific from the second generic (changing its
-// overload set) or arbitrarily pick a "winner", the whole second generic
-// is refused.
+// does not allow the same explicit interface to be declared twice. The
+// second generic names it in a `procedure ::` statement instead, which
+// any procedure with an explicit interface may appear in. So does a
+// generic of this module whose specific comes from another module that
+// this module also re-exports by name (`reexported`): the `use` statement
+// doing that provides its interface. Any other foreign specific has its
+// interface inlined like a local one -- its module need not be installed
+// at all (gfortran's openacc.mod takes its specifics from an
+// openacc_internal whose module file it never ships).
+//
+// `public_name` is the generic-spec: a name, or an "operator(...)" /
+// "assignment(=)" spelling for a defined operator.
 std::vector<std::string> emit_generic(const std::string &public_name,
-                                       const GenericInterface &gi,
+                                       const std::vector<int> &specifics,
                                        const std::map<int, Symbol> &symbols,
                                        const std::string &current_module,
                                        NeededUses &uses,
-                                       std::set<int> &specifics_already_declared) {
+                                       std::set<int> &specifics_already_declared,
+                                       const std::set<int> &reexported,
+                                       const UnsupportedKinds &kinds) {
   // Built up locally and only merged into the shared set once the whole
   // generic succeeds -- a generic that fails partway through (any one
   // specific unsupported) must not "claim" the specifics it did manage to
   // render, or a later, otherwise-fine generic sharing one of them would
   // be wrongly refused as a false duplicate.
   std::vector<int> newly_claimed;
+  NeededUses foreign_uses; // merged into `uses` only on success, as above
 
   std::vector<std::string> lines;
   lines.push_back("interface " + public_name);
-  for (int specific_num : gi.specifics) {
+  std::set<int> in_this_block;
+  for (int specific_num : specifics) {
+    if (!in_this_block.insert(specific_num).second)
+      continue;
     auto it = symbols.find(specific_num);
     if (it == symbols.end())
       throw UnsupportedError("specific procedure symbol " +
@@ -283,19 +518,33 @@ std::vector<std::string> emit_generic(const std::string &public_name,
       throw UnsupportedError("specific procedure '" + it->second.name +
                               "' is an internal compiler-generated symbol "
                               "with no valid Fortran spelling");
-    if (specifics_already_declared.count(specific_num))
-      throw UnsupportedError(
-          "specific procedure '" + it->second.name +
-          "' is already declared under another generic name in this "
-          "module's output -- Fortran doesn't allow the same explicit "
-          "interface twice");
+    if (unsupported_type(it->second, symbols, kinds))
+      continue; // the target could not call it anyway
+    if (reexported.count(specific_num)) {
+      record_use(foreign_uses, it->second.module_name, it->second.name,
+                 it->second.name);
+      lines.push_back("  procedure :: " + it->second.name);
+      continue;
+    }
+    if (specifics_already_declared.count(specific_num)) {
+      lines.push_back("  procedure :: " + it->second.name);
+      continue;
+    }
     std::vector<std::string> body = emit_interface_body(
         it->second.name, it->second, symbols, current_module, uses);
     lines.insert(lines.end(), body.begin(), body.end());
     newly_claimed.push_back(specific_num);
   }
+  if (lines.size() == 1)
+    throw UnsupportedError("every specific uses a type the target lacks");
   lines.push_back("end interface " + public_name);
   specifics_already_declared.insert(newly_claimed.begin(), newly_claimed.end());
+  for (auto &[key, mu] : foreign_uses) {
+    ModuleUse &into = uses[key];
+    into.display_name = mu.display_name;
+    into.intrinsic = mu.intrinsic;
+    into.only_clauses.insert(mu.only_clauses.begin(), mu.only_clauses.end());
+  }
   return lines;
 }
 
@@ -320,10 +569,23 @@ derived_types_by_name(const std::map<int, Symbol> &symbols) {
 Analysis analyse(const std::map<int, Symbol> &symbols,
                   const std::map<std::string, int> &symtree,
                   const std::map<std::string, GenericInterface> &generics,
-                  const std::string &current_module) {
+                  const std::vector<OperatorInterface> &operators,
+                  const std::string &current_module,
+                  const UnsupportedKinds &kinds,
+                  const AvailableModules &available) {
+  // Whether a `use` of `module` can compile where the source is going.
+  auto usable = [&available](const std::string &module) {
+    const std::string key = lower(module);
+    if (!available || resolve_module_name(module).intrinsic ||
+        kCompilerSupplied.count(key))
+      return true;
+    return std::find(available->begin(), available->end(), key) !=
+           available->end();
+  };
   Analysis a;
   std::set<int> emitted;
   std::set<std::string> handled_generic_names;
+  std::vector<int> binding_targets; // type-bound procedures' targets
   std::map<std::string, const Symbol *> derived_by_name =
       derived_types_by_name(symbols);
 
@@ -342,6 +604,21 @@ Analysis analyse(const std::map<int, Symbol> &symbols,
     for (int s : gi.specifics)
       specifics_used_in_generics.insert(s);
   }
+  for (const OperatorInterface &op : operators)
+    for (int s : op.specifics)
+      specifics_used_in_generics.insert(s);
+  // Public names this module passes on from another one; see the
+  // re-export branch below.
+  std::set<int> reexported;
+  for (const auto &[public_name, number] : symtree) {
+    (void)public_name;
+    auto it = symbols.find(number);
+    if (it != symbols.end() && !it->second.module_name.empty() &&
+        it->second.flavor() != "MODULE" && !it->second.is_artificial() &&
+        lower(it->second.module_name) != lower(current_module) &&
+        usable(it->second.module_name))
+      reexported.insert(number);
+  }
 
   auto emit_derived = [&](const std::string &public_name, const Symbol &sym) {
     if (emitted.count(sym.number))
@@ -352,19 +629,55 @@ Analysis analyse(const std::map<int, Symbol> &symbols,
       // re-exporting via `use <module>, only: <name>` instead of
       // redeclaring it locally from this module's own (possibly
       // incomplete) copy of its component list.
-      record_use(a.uses, sym.module_name, sym.name, public_name);
-      emitted.insert(sym.number);
-      return;
+      if (usable(sym.module_name)) {
+        record_use(a.uses, sym.module_name, sym.name, public_name);
+        emitted.insert(sym.number);
+        return;
+      }
+      // Its module is not there to be used: redeclare it, as long as this
+      // copy carries the components (a stub does not).
+      if (sym.components.empty()) {
+        a.problems.push_back("type '" + public_name + "' comes from '" +
+                              sym.module_name + "', which is not available, "
+                              "and its components are not recorded here");
+        emitted.insert(sym.number);
+        return;
+      }
     }
     std::vector<std::string> lines;
-    lines.push_back("type :: " + public_name);
-    for (const Component &comp : sym.components) {
+    std::string header = "type";
+    if (has_attr(sym, "ABSTRACT"))
+      header += ", abstract";
+    // An extension's parent is its first component, named like the parent
+    // type; declared as the extension it is, not as a component.
+    std::size_t first = 0;
+    if (sym.extension > 0 && !sym.components.empty() &&
+        sym.components[0].typespec && sym.components[0].typespec->derived_ref) {
+      try {
+        std::string parent =
+            sym.components[0].typespec->to_fortran(symbols, current_module, a.uses);
+        header += ", extends(" + parent.substr(5, parent.size() - 6) + ")";
+        first = 1;
+      } catch (const sexpr::FormatError &exc) {
+        a.problems.push_back("type '" + public_name + "': " + exc.what());
+        return;
+      }
+    }
+    lines.push_back(header + " :: " + public_name);
+    for (std::size_t ci = first; ci < sym.components.size(); ++ci) {
+      const Component &comp = sym.components[ci];
       if (comp.is_internal())
         continue; // vtable machinery, no source spelling
       if (!comp.typespec.has_value()) {
         a.problems.push_back("type '" + public_name + "': component '" +
                               comp.name + "' has a type that cannot be "
                               "expressed");
+        return;
+      }
+      if (auto t = unsupported_type(comp.typespec, kinds)) {
+        a.problems.push_back("type '" + public_name + "': component '" +
+                              comp.name + "' is " + *t +
+                              ", which is not available on the target");
         return;
       }
       try {
@@ -377,17 +690,105 @@ Analysis analyse(const std::map<int, Symbol> &symbols,
         return;
       }
     }
+    if (sym.has_typebound_operators) {
+      a.problems.push_back("type '" + public_name +
+                            "': type-bound operators are not translated");
+      return;
+    }
+    if (!sym.bindings.empty()) {
+      lines.push_back("contains");
+      for (const Binding &b : sym.bindings) {
+        std::string attrs = b.is_private ? ", private" : "";
+        if (b.generic) {
+          std::string specifics;
+          for (const std::string &g : b.generic_bindings)
+            specifics += (specifics.empty() ? "" : ", ") + g;
+          lines.push_back("  generic" + attrs + " :: " + b.name + " => " +
+                          specifics);
+          continue;
+        }
+        auto target = symbols.find(b.target);
+        if (target == symbols.end()) {
+          a.problems.push_back("type '" + public_name + "': binding '" + b.name +
+                                "' has an unknown target");
+          return;
+        }
+        attrs += b.nopass ? ", nopass"
+                          : (b.pass_arg.empty() ? "" : ", pass(" + b.pass_arg + ")");
+        if (b.non_overridable)
+          attrs += ", non_overridable";
+        // The target (a deferred binding's: its interface) is declared at
+        // module level, from wherever it comes.
+        binding_targets.push_back(b.target);
+        if (b.deferred)
+          lines.push_back("  procedure(" + target->second.name + "), deferred" +
+                          attrs + " :: " + b.name);
+        else if (lower(target->second.name) == lower(b.name))
+          lines.push_back("  procedure" + attrs + " :: " + b.name);
+        else
+          lines.push_back("  procedure" + attrs + " :: " + b.name + " => " +
+                          target->second.name);
+      }
+    }
     lines.push_back("end type " + public_name);
     a.body.insert(a.body.end(), lines.begin(), lines.end());
     emitted.insert(sym.number);
   };
 
-  // Derived types first; later declarations may refer to them.
+  // Derived types first; later declarations may refer to them. Among
+  // themselves they go in component order: a type is declared after the
+  // types of its components, which Fortran requires of a component that is
+  // neither pointer nor allocatable -- and those of this module's types a
+  // component refers to are declared even when they are not public.
+  std::map<const Symbol *, std::string> type_names;
   for (const auto &[public_name, number] : symtree) {
     (void)number;
     auto it = derived_by_name.find(lower(public_name));
     if (it != derived_by_name.end())
-      emit_derived(public_name, *it->second);
+      type_names.emplace(it->second, public_name);
+  }
+  std::set<const Symbol *> visiting;
+  std::function<void(const Symbol &, const std::string &)> declare_type =
+      [&](const Symbol &type, const std::string &public_name) {
+        if (emitted.count(type.number) || !visiting.insert(&type).second)
+          return; // done, or a cycle through pointer components
+        for (const Component &comp : type.components) {
+          if (!comp.typespec || comp.typespec->base != "DERIVED" ||
+              !comp.typespec->derived_ref || comp.typespec->is_class)
+            continue;
+          auto dep = symbols.find(*comp.typespec->derived_ref);
+          if (dep == symbols.end() || dep->second.flavor() != "DERIVED" ||
+              dep->second.is_artificial() ||
+              lower(dep->second.module_name) != lower(current_module))
+            continue;
+          auto named = type_names.find(&dep->second);
+          declare_type(dep->second, named != type_names.end()
+                                        ? named->second
+                                        : dep->second.name);
+        }
+        emit_derived(public_name, type);
+      };
+  for (const auto &[type, public_name] : type_names)
+    declare_type(*type, public_name);
+
+  // Then abstract interfaces: a procedure(iface) declaration anywhere below
+  // may name one, and must come after it.
+  for (const auto &[public_name, number] : symtree) {
+    auto sit = symbols.find(number);
+    if (sit == symbols.end() || derived_by_name.count(lower(public_name)) ||
+        sit->second.flavor() != "PROCEDURE" || !has_attr(sit->second, "ABSTRACT") ||
+        lower(sit->second.module_name) != lower(current_module))
+      continue;
+    try {
+      std::vector<std::string> lines = emit_interface(
+          public_name, sit->second, symbols, current_module, a.uses);
+      a.body.insert(a.body.end(), lines.begin(), lines.end());
+      emitted.insert(number);
+    } catch (const fxmod::Error &exc) {
+      a.problems.push_back("abstract interface '" + public_name + "': " +
+                            exc.what());
+      emitted.insert(number); // reported once, not again below
+    }
   }
 
   for (const auto &[public_name, number] : symtree) {
@@ -400,7 +801,40 @@ Analysis analyse(const std::map<int, Symbol> &symbols,
     const Symbol &sym = sit->second;
     if (sym.flavor() == "MODULE")
       continue; // a use-associated module, not a declaration of our own
+    if (!sym.module_name.empty() &&
+        lower(sym.module_name) != lower(current_module)) {
+      // Re-exported from the module that defines it (iso_c_binding's
+      // constants and procedures, or a whole module USEd and passed on):
+      // this module's copy is only a reference, so `use` the original
+      // rather than redeclaring it -- a redeclaration would be a distinct
+      // entity, and clash with the original wherever both are visible.
+      if (unsupported_type(sym, symbols, kinds)) {
+        // Left out of its own module's translation as well.
+        emitted.insert(number);
+        continue;
+      }
+      if (usable(sym.module_name)) {
+        record_use(a.uses, sym.module_name, sym.name, public_name);
+        emitted.insert(number);
+        continue;
+      }
+      // Its module is not there to be used: declare it from this module's
+      // copy below, which for a constant or an interface is as good.
+      if (sym.flavor() == "VARIABLE") {
+        a.problems.push_back("variable '" + public_name + "' comes from '" +
+                              sym.module_name + "', which is not available");
+        continue;
+      }
+    }
 
+    // (A generic's specifics are vetted where the generic is emitted.)
+    if ((sym.flavor() != "PROCEDURE" || !sym.is_generic()) &&
+        !specifics_used_in_generics.count(number))
+      if (auto t = unsupported_type(sym, symbols, kinds)) {
+        a.problems.push_back("'" + public_name + "': " + *t +
+                              " is not available on the target");
+        continue;
+      }
     if (sym.flavor() == "PARAMETER") {
       if (!sym.typespec.has_value() || !sym.value_node.has_value()) {
         a.problems.push_back("named constant '" + public_name +
@@ -417,6 +851,8 @@ Analysis analyse(const std::map<int, Symbol> &symbols,
       try {
         std::string decl =
             sym.typespec->to_fortran(symbols, current_module, a.uses);
+        if (sym.array_spec)
+          decl += ", dimension" + sym.array_spec->to_fortran(symbols);
         a.body.push_back(decl + ", parameter :: " + public_name + " = " +
                           *value);
         emitted.insert(number);
@@ -430,6 +866,13 @@ Analysis analyse(const std::map<int, Symbol> &symbols,
             sym.typespec->to_fortran(symbols, current_module, a.uses);
         if (sym.array_spec)
           decl += ", dimension" + sym.array_spec->to_fortran(symbols);
+        // Deferred shapes and lengths are only valid on these.
+        for (const char *attr : {"ALLOCATABLE", "POINTER", "TARGET"})
+          if (has_attr(sym, attr))
+            decl += ", " + lower(attr);
+        if (std::string ca = class_attribute(*sym.typespec, symbols);
+            !ca.empty() && decl.find(", " + ca) == std::string::npos)
+          decl += ", " + ca;
         a.body.push_back(decl + " :: " + public_name);
         emitted.insert(number);
       } catch (const sexpr::FormatError &exc) {
@@ -449,8 +892,8 @@ Analysis analyse(const std::map<int, Symbol> &symbols,
       handled_generic_names.insert(key);
       try {
         std::vector<std::string> lines = emit_generic(
-            public_name, git->second, symbols, current_module, a.uses,
-            specifics_already_declared);
+            public_name, git->second.specifics, symbols, current_module,
+            a.uses, specifics_already_declared, reexported, kinds);
         a.body.insert(a.body.end(), lines.begin(), lines.end());
         emitted.insert(number);
       } catch (const fxmod::Error &exc) {
@@ -486,16 +929,95 @@ Analysis analyse(const std::map<int, Symbol> &symbols,
   // marked GENERIC (handled above, in symtree order like everything
   // else). Runs after the main pass so any derived types it might
   // reference are already declared.
-  for (const auto &[key, gi] : generics) {
-    if (handled_generic_names.count(key) || derived_by_name.count(key))
+  for (const auto &[key, gi_in] : generics) {
+    if (handled_generic_names.count(key))
       continue;
+    GenericInterface gi = gi_in;
+    if (derived_by_name.count(key)) {
+      // A generic named like a type: gfortran's structure constructor,
+      // listed with the type itself among its specifics, and whatever
+      // functions the source added to it (an overloaded constructor).
+      auto end = std::remove_if(gi.specifics.begin(), gi.specifics.end(), [&](int n) {
+        auto it = symbols.find(n);
+        return it == symbols.end() || it->second.flavor() == "DERIVED";
+      });
+      gi.specifics.erase(end, gi.specifics.end());
+      if (gi.specifics.empty())
+        continue;
+      gi.name = derived_by_name.at(key)->name;
+    }
+    if (!gi.module.empty() && lower(gi.module) != lower(current_module) &&
+        usable(gi.module)) {
+      // A generic USEd from its defining module and passed on.
+      record_use(a.uses, gi.module, gi.name, gi.name);
+      continue;
+    }
     try {
       std::vector<std::string> lines = emit_generic(
-          gi.name, gi, symbols, current_module, a.uses,
-          specifics_already_declared);
+          gi.name, gi.specifics, symbols, current_module, a.uses,
+          specifics_already_declared, reexported, kinds);
       a.body.insert(a.body.end(), lines.begin(), lines.end());
     } catch (const fxmod::Error &exc) {
       a.problems.push_back("generic '" + gi.name + "': " + exc.what());
+    }
+  }
+
+  // Defined operators and assignment. The module file records no owner for
+  // these, only their specifics: those defined elsewhere are reached by
+  // using the operator from each specific's own module, the rest get an
+  // interface block of this module's own.
+  for (const OperatorInterface &op : operators) {
+    std::vector<int> local;
+    for (int s : op.specifics) {
+      auto it = symbols.find(s);
+      if (it != symbols.end() && !it->second.module_name.empty() &&
+          lower(it->second.module_name) != lower(current_module) &&
+          usable(it->second.module_name))
+        record_use(a.uses, it->second.module_name, op.spelling, op.spelling);
+      else
+        local.push_back(s);
+    }
+    if (local.empty())
+      continue;
+    try {
+      std::vector<std::string> lines =
+          emit_generic(op.spelling, local, symbols, current_module, a.uses,
+                       specifics_already_declared, reexported, kinds);
+      a.body.insert(a.body.end(), lines.begin(), lines.end());
+    } catch (const fxmod::Error &exc) {
+      a.problems.push_back(op.spelling + ": " + exc.what());
+    }
+  }
+
+  // The procedures type-bound procedures are bound to need interfaces of
+  // their own here. Those not declared by now are not public: declared
+  // private, or use-associated from the module that defines them.
+  std::set<std::string> public_names;
+  for (const auto &[public_name, number] : symtree) {
+    (void)number;
+    public_names.insert(lower(public_name));
+  }
+  for (int target : binding_targets) {
+    auto it = symbols.find(target);
+    if (it == symbols.end() || emitted.count(target) ||
+        specifics_already_declared.count(target))
+      continue;
+    const Symbol &proc = it->second;
+    emitted.insert(target);
+    if (lower(proc.module_name) != lower(current_module) &&
+        usable(proc.module_name)) {
+      record_use(a.uses, proc.module_name, proc.name, proc.name);
+      continue;
+    }
+    if (public_names.count(lower(proc.name)))
+      continue; // declared under its public name above
+    try {
+      std::vector<std::string> lines =
+          emit_interface(proc.name, proc, symbols, current_module, a.uses);
+      a.body.insert(a.body.end(), lines.begin(), lines.end());
+      a.body.push_back("private :: " + proc.name);
+    } catch (const fxmod::Error &exc) {
+      a.problems.push_back("binding target '" + proc.name + "': " + exc.what());
     }
   }
 
@@ -518,15 +1040,19 @@ std::string summarise_problems(const std::vector<std::string> &problems,
 
 } // namespace
 
-EmitResult emit_fortran_source(const Module &module, bool strict) {
+EmitResult emit_fortran_source(const Module &module, bool strict,
+                               const UnsupportedKinds &kinds,
+                               const AvailableModules &available) {
   std::map<int, Symbol> symbols = parse_symbols(module);
   std::map<std::string, int> symtree = parse_symtree(module);
   if (symtree.empty())
     throw UnsupportedError(module.path + ": no public symbols found");
   std::map<std::string, GenericInterface> generics = parse_generic_interfaces(module);
+  std::vector<OperatorInterface> operators = parse_operator_interfaces(module);
   std::string name = module.name();
 
-  Analysis a = analyse(symbols, symtree, generics, name);
+  Analysis a =
+      analyse(symbols, symtree, generics, operators, name, kinds, available);
   if (!a.problems.empty() && strict) {
     throw UnsupportedError(module.path + ": " +
                             std::to_string(a.problems.size()) +
@@ -536,7 +1062,16 @@ EmitResult emit_fortran_source(const Module &module, bool strict) {
 
   std::string source = "module " + name + "\n";
   for (const auto &[key, mu] : a.uses) {
-    (void)key;
+    if (kCompilerSupplied.count(key)) {
+      source += "use " + mu.display_name + "\n";
+      std::string renames;
+      for (const std::string &clause : mu.only_clauses)
+        if (clause.find("=>") != std::string::npos && clause.find("operator(") != 0)
+          renames += (renames.empty() ? "" : ", ") + clause;
+      if (!renames.empty())
+        source += "use " + mu.display_name + ", only: " + renames + "\n";
+      continue;
+    }
     source += mu.intrinsic ? "use, intrinsic :: " : "use ";
     source += mu.display_name;
     if (!mu.only_clauses.empty()) {

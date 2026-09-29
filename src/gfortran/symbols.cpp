@@ -43,6 +43,12 @@ bool same_module(const std::string &a, const std::string &b) {
 ResolvedModuleName resolve_module_name(const std::string &module_name) {
   if (starts_with(module_name, "__"))
     return {module_name.substr(2), true};
+  // The IEEE modules are intrinsic too, but gfortran spells them plainly.
+  static const char *const kPlainIntrinsic[] = {
+      "ieee_arithmetic", "ieee_exceptions", "ieee_features"};
+  for (const char *m : kPlainIntrinsic)
+    if (lower_copy(module_name) == m)
+      return {module_name, true};
   return {module_name, false};
 }
 
@@ -68,6 +74,7 @@ std::vector<Component> parse_components(const Node &node) {
     if (entry.is_list() && entry.list().size() >= 3 &&
         entry.list()[0].is_int() && entry.list()[1].is_str()) {
       Component c;
+      c.id = static_cast<int>(entry.list()[0].integer());
       c.name = entry.list()[1].str();
       c.typespec = parse_typespec(entry.list()[2]);
       components.push_back(std::move(c));
@@ -106,11 +113,25 @@ ArrayBound parse_bound(const Node &node) {
   }
   if (kind == "VARIABLE") {
     // (VARIABLE <typespec> <rank> <symtree-ref> <ref-list> ...) --
-    // mio_symtree_ref() writes a bare symbol number.
+    // mio_symtree_ref() writes a bare symbol number, mio_ref_list() one
+    // entry per reference below it. Component references (`self%n`, as
+    // (COMPONENT <derived-type> <component-id>)) are decoded; array and
+    // substring references are not.
     if (l.size() < 4 || !l[3].is_int())
       throw sexpr::FormatError("unsupported variable array bound");
     b.kind = ArrayBound::Kind::SymbolRef;
     b.symbol_ref = static_cast<int>(l[3].integer());
+    if (l.size() > 4 && l[4].is_list()) {
+      for (const Node &ref : l[4].list()) {
+        if (!ref.is_list() || ref.list().size() < 3 || !ref.list()[0].is_name() ||
+            ref.list()[0].name() != "COMPONENT" || !ref.list()[1].is_int() ||
+            !ref.list()[2].is_int())
+          throw sexpr::FormatError("array bound reference is not decoded "
+                                    "(only component references are)");
+        b.components.emplace_back(static_cast<int>(ref.list()[1].integer()),
+                                  static_cast<int>(ref.list()[2].integer()));
+      }
+    }
     return b;
   }
   throw sexpr::FormatError("array bound expression '" + kind +
@@ -129,10 +150,76 @@ std::string bound_text(const ArrayBound &b, const std::map<int, Symbol> &symbols
     if (it == symbols.end())
       throw sexpr::FormatError("array bound references unknown symbol " +
                                 std::to_string(b.symbol_ref));
-    return it->second.name;
+    std::string text = it->second.name;
+    for (const auto &[type_ref, comp_id] : b.components) {
+      (void)type_ref;
+      // Component ids share the symbol pool's numbering, so the id alone
+      // identifies the component -- which need not belong to the type the
+      // reference names: through a CLASS dummy that is the __class_*
+      // container, and the component one of the declared type's.
+      const Component *comp = nullptr;
+      for (const auto &[number, sym] : symbols) {
+        (void)number;
+        for (const Component &c : sym.components)
+          if (c.id == comp_id)
+            comp = &c;
+      }
+      if (comp == nullptr)
+        throw sexpr::FormatError("array bound references unknown component " +
+                                  std::to_string(comp_id));
+      text += "%" + comp->name;
+    }
+    return text;
   }
   }
   return "";
+}
+
+// One type-bound procedure: ( '<name>' ( <access> <overridability>
+// <PASS|NOPASS> <SPECIFIC|GENERIC> <PPC|NO_PPC> '<pass-arg>' <pass-arg-num>
+// <target> ) ), the target a symbol number, or for a generic a flat list
+// ( <n> '<specific binding>' ... ).
+std::optional<Binding> parse_binding(const Node &entry) {
+  if (!entry.is_list() || entry.list().size() < 2 || !entry.list()[0].is_str() ||
+      !entry.list()[1].is_list())
+    return std::nullopt;
+  const List &d = entry.list()[1].list();
+  Binding b;
+  b.name = entry.list()[0].str();
+  std::size_t i = 0;
+  for (; i < d.size() && d[i].is_name(); ++i) {
+    const std::string &a = d[i].name();
+    if (a == "PRIVATE")
+      b.is_private = true;
+    else if (a == "DEFERRED")
+      b.deferred = true;
+    else if (a == "NON_OVERRIDABLE")
+      b.non_overridable = true;
+    else if (a == "NOPASS")
+      b.nopass = true;
+    else if (a == "GENERIC")
+      b.generic = true;
+    else if (a == "PPC")
+      return std::nullopt; // a procedure-pointer component, not a binding
+  }
+  if (i < d.size() && d[i].is_str())
+    b.pass_arg = d[i++].str();
+  if (i < d.size() && d[i].is_int())
+    ++i; // the pass argument's position
+  if (i >= d.size())
+    return std::nullopt;
+  if (b.generic) {
+    if (!d[i].is_list())
+      return std::nullopt;
+    for (const Node &g : d[i].list())
+      if (g.is_str())
+        b.generic_bindings.push_back(g.str());
+  } else {
+    if (!d[i].is_int())
+      return std::nullopt;
+    b.target = static_cast<int>(d[i].integer());
+  }
+  return b;
 }
 
 // Returns (symbol pool, symtree): the last two top-level items in the
@@ -161,24 +248,55 @@ std::optional<TypeSpec> parse_typespec(const Node &node) {
   if (!head.is_name())
     return std::nullopt;
   const std::string &base = head.name();
-  if (base == "UNKNOWN")
-    return std::nullopt;
 
   auto second_as_int = [&]() -> std::optional<int> {
     if (l.size() > 1 && l[1].is_int())
       return static_cast<int>(l[1].integer());
     return std::nullopt;
   };
+  // mio_typespec(): type, kind or derived type, interface, ...
+  std::optional<int> interface_ref;
+  if (l.size() > 2 && l[2].is_int() && l[2].integer() != 0)
+    interface_ref = static_cast<int>(l[2].integer());
 
+  if (base == "UNKNOWN") {
+    if (!interface_ref)
+      return std::nullopt;
+    TypeSpec ts; // a procedure(iface) entity, typed by its interface
+    ts.base = base;
+    ts.interface_ref = interface_ref;
+    return ts;
+  }
   if (base == "DERIVED" || base == "CLASS") {
     TypeSpec ts;
     ts.base = "DERIVED";
+    ts.is_class = base == "CLASS";
     ts.derived_ref = second_as_int();
+    ts.interface_ref = interface_ref;
     return ts;
   }
   TypeSpec ts;
   ts.base = base;
   ts.kind = second_as_int();
+  ts.interface_ref = interface_ref;
+  if (base == "CHARACTER" && l.size() > 6 && l[6].is_list()) {
+    // mio_charlen(): ( <length-expr> ), the expression empty for len=*
+    // and len=:, which a trailing DEFERRED_CL tells apart.
+    const List &cl = l[6].list();
+    if (l.size() > 7 && l[7].is_name() && l[7].name() == "DEFERRED_CL") {
+      ts.char_len = TypeSpec::CharLen::Deferred;
+    } else if (cl.size() == 1 && cl[0].is_list() && cl[0].list().empty()) {
+      ts.char_len = TypeSpec::CharLen::Assumed;
+    } else if (cl.size() == 1) {
+      try {
+        ts.char_len_bound = parse_bound(cl[0]);
+        ts.char_len = TypeSpec::CharLen::Bound;
+      } catch (const sexpr::FormatError &) {
+        // A length expression beyond a constant or plain reference: left
+        // undecoded, as before lengths were read at all.
+      }
+    }
+  }
   return ts;
 }
 
@@ -192,6 +310,27 @@ std::string TypeSpec::to_fortran(const std::map<int, Symbol> &symbols,
     if (it == symbols.end())
       throw sexpr::FormatError("derived typespec references unknown symbol " +
                                 std::to_string(*derived_ref));
+    if (is_class) {
+      // CLASS(t) points at gfortran's __class_* container; its _data
+      // component is typed with the declared type. CLASS(*)'s is the
+      // internal STAR type.
+      auto data = std::find_if(it->second.components.begin(),
+                               it->second.components.end(),
+                               [](const Component &c) { return c.name == "_data"; });
+      if (data == it->second.components.end() || !data->typespec ||
+          !data->typespec->derived_ref)
+        throw sexpr::FormatError("class typespec without a declared type");
+      auto declared = symbols.find(*data->typespec->derived_ref);
+      if (declared == symbols.end())
+        throw sexpr::FormatError("class typespec references unknown symbol " +
+                                  std::to_string(*data->typespec->derived_ref));
+      if (lower_copy(declared->second.name) == "star")
+        return "class(*)";
+      if (!same_module(declared->second.module_name, current_module))
+        record_use(uses, declared->second.module_name, declared->second.name,
+                   declared->second.name);
+      return "class(" + declared->second.name + ")";
+    }
     if (!same_module(it->second.module_name, current_module))
       record_use(uses, it->second.module_name, it->second.name,
                  it->second.name);
@@ -208,9 +347,46 @@ std::string TypeSpec::to_fortran(const std::map<int, Symbol> &symbols,
   if (base == "CHARACTER") {
     if (!kind.has_value())
       throw sexpr::FormatError("character typespec has no kind");
-    return "character(kind=" + std::to_string(*kind) + ")";
+    std::string len;
+    switch (char_len) {
+    case CharLen::None:
+      break;
+    case CharLen::Assumed:
+      len = "len=*, ";
+      break;
+    case CharLen::Deferred:
+      len = "len=:, ";
+      break;
+    case CharLen::Bound:
+      len = "len=" + bound_text(char_len_bound, symbols) + ", ";
+      break;
+    }
+    return "character(" + len + "kind=" + std::to_string(*kind) + ")";
   }
+  if (base == "ASSUMED")
+    return "type(*)"; // assumed type, e.g. an MPI choice buffer
   throw sexpr::FormatError("unsupported base type " + base);
+}
+
+std::string class_attribute(const TypeSpec &ts, const std::map<int, Symbol> &symbols) {
+  if (!ts.is_class || !ts.derived_ref)
+    return "";
+  auto it = symbols.find(*ts.derived_ref);
+  if (it == symbols.end())
+    return "";
+  // gfc_build_class_symbol() in class.cc names the container after the
+  // entity's attributes: __class_<type>_p for a pointer, _a for an
+  // allocatable, _t for neither; _<rank>_<corank>p/a/t for an array.
+  const std::string &name = it->second.name;
+  static const std::regex kSuffix(R"(_(\d+_\d+)?([pat])$)");
+  std::smatch m;
+  if (!std::regex_search(name, m, kSuffix))
+    return "";
+  if (m[2] == "p")
+    return "pointer";
+  if (m[2] == "a")
+    return "allocatable";
+  return "";
 }
 
 std::optional<ArraySpec> parse_array_spec(const Node &node) {
@@ -327,10 +503,20 @@ std::map<int, Symbol> parse_symbols(const Module &module) {
       const List &body = flat[i + 5].list();
 
       std::vector<std::string> attrs;
-      if (!body.empty() && body[0].is_list())
-        for (const Node &a : body[0].list())
+      // mio_symbol_attribute(): flavor, intent, proc, if_source, save,
+      // ext_attr, extension, then the attribute names.
+      unsigned ext_attr = 0;
+      int extension = 0;
+      if (!body.empty() && body[0].is_list()) {
+        const List &al = body[0].list();
+        for (const Node &a : al)
           if (a.is_name())
             attrs.push_back(a.name());
+        if (al.size() > 5 && al[5].is_int())
+          ext_attr = static_cast<unsigned>(al[5].integer());
+        if (al.size() > 6 && al[6].is_int())
+          extension = static_cast<int>(al[6].integer());
+      }
 
       const Node *raw_components =
           body.size() > 1 ? &body[1] : nullptr;
@@ -370,6 +556,11 @@ std::map<int, Symbol> parse_symbols(const Module &module) {
           value_node = *v;
       }
       const Node *array_node = is_parameter ? at(5) : at(4);
+      const Node *result_node = is_parameter ? at(6) : at(5);
+      std::optional<int> result_ref;
+      if (result_node && result_node->is_int() && result_node->integer() != 0 &&
+          result_node->integer() != number)
+        result_ref = static_cast<int>(result_node->integer());
       std::optional<ArraySpec> array_spec;
       if (array_node) {
         try {
@@ -385,6 +576,22 @@ std::map<int, Symbol> parse_symbols(const Module &module) {
         }
       }
 
+      // A derived type's f2k namespace follows the result reference:
+      // ( <finalizers> <type-bound procedures> <type-bound operators> ... ).
+      std::vector<Binding> bindings;
+      bool has_tb_operators = false;
+      if (contains(attrs, "DERIVED") || (!attrs.empty() && attrs[0] == "DERIVED")) {
+        const Node *f2k = at(6);
+        if (f2k && f2k->is_list() && f2k->list().size() >= 3) {
+          const List &fl = f2k->list();
+          if (fl[1].is_list())
+            for (const Node &entry : fl[1].list())
+              if (auto b = parse_binding(entry))
+                bindings.push_back(std::move(*b));
+          has_tb_operators = fl[2].is_list() && !fl[2].list().empty();
+        }
+      }
+
       Symbol sym;
       sym.number = number;
       sym.name = std::move(name);
@@ -395,6 +602,11 @@ std::map<int, Symbol> parse_symbols(const Module &module) {
       sym.value_node = std::move(value_node);
       sym.formal_args = std::move(formal_args);
       sym.array_spec = std::move(array_spec);
+      sym.ext_attr = ext_attr;
+      sym.result_ref = result_ref;
+      sym.extension = extension;
+      sym.bindings = std::move(bindings);
+      sym.has_typebound_operators = has_tb_operators;
       symbols[number] = std::move(sym);
 
       i += 6;
@@ -441,6 +653,8 @@ std::map<std::string, GenericInterface> parse_generic_interfaces(const Module &m
       continue;
     GenericInterface gi;
     gi.name = e[0].str();
+    if (e[1].is_str())
+      gi.module = e[1].str();
     for (std::size_t i = 2; i < e.size(); ++i)
       if (e[i].is_int())
         gi.specifics.push_back(static_cast<int>(e[i].integer()));
@@ -448,6 +662,81 @@ std::map<std::string, GenericInterface> parse_generic_interfaces(const Module &m
       std::string key = gi.name;
       std::transform(key.begin(), key.end(), key.begin(), ::tolower);
       out[key] = std::move(gi);
+    }
+  }
+  return out;
+}
+
+std::vector<OperatorInterface> parse_operator_interfaces(const Module &module) {
+  // Source spelling of each gfc_intrinsic_op, in enum order with
+  // INTRINSIC_USER left out, as write_module() does. The old-style
+  // relational block (.eq., .ne., ...), which follows the new-style one,
+  // and the unary forms of + and - share a spelling with their
+  // counterparts, so they land in the same interface.
+  // INTRINSIC_PARENTHESES has no source spelling and never has specifics.
+  static const char *const kIntrinsicOps[] = {
+      "operator(+)",      "operator(-)",     // INTRINSIC_UPLUS, _UMINUS
+      "operator(+)",      "operator(-)",     "operator(*)",
+      "operator(/)",      "operator(**)",    "operator(//)",
+      "operator(.and.)",  "operator(.or.)",  "operator(.eqv.)",
+      "operator(.neqv.)",
+      "operator(==)",     "operator(/=)",    "operator(>)", // INTRINSIC_EQ..LE
+      "operator(>=)",     "operator(<)",     "operator(<=)",
+      "operator(==)",     "operator(/=)",    "operator(>)", // INTRINSIC_EQ_OS..LE_OS
+      "operator(>=)",     "operator(<)",     "operator(<=)",
+      "operator(.not.)",  "assignment(=)",   // INTRINSIC_NOT, _ASSIGN
+      nullptr};                              // INTRINSIC_PARENTHESES
+  constexpr std::size_t kCount = sizeof(kIntrinsicOps) / sizeof(kIntrinsicOps[0]);
+
+  std::vector<OperatorInterface> out;
+  // The two operator sections lead the module body; the symbol pool and
+  // symtree close it (see sections()). A body too short to hold all four
+  // has no operator sections to read.
+  if (module.forest.size() < 4)
+    return out;
+  auto add = [&out](const std::string &spelling, int specific) {
+    auto it = std::find_if(out.begin(), out.end(), [&](const auto &op) {
+      return op.spelling == spelling;
+    });
+    if (it == out.end()) {
+      out.push_back({spelling, {}});
+      it = out.end() - 1;
+    }
+    if (std::find(it->specifics.begin(), it->specifics.end(), specific) ==
+        it->specifics.end())
+      it->specifics.push_back(specific);
+  };
+
+  if (module.forest[0].is_list()) {
+    const List &ops = module.forest[0].list();
+    if (ops.size() != kCount)
+      throw sexpr::FormatError(module.path + ": intrinsic-operator section has " +
+                                std::to_string(ops.size()) + " entries, expected " +
+                                std::to_string(kCount));
+    for (std::size_t i = 0; i < kCount; ++i) {
+      if (!ops[i].is_list())
+        throw sexpr::FormatError(module.path +
+                                  ": malformed intrinsic-operator entry");
+      for (const Node &n : ops[i].list())
+        if (n.is_int()) {
+          if (kIntrinsicOps[i] == nullptr)
+            throw sexpr::FormatError(module.path +
+                                      ": specifics for an operator with no "
+                                      "source spelling");
+          add(kIntrinsicOps[i], static_cast<int>(n.integer()));
+        }
+    }
+  }
+
+  if (module.forest[1].is_list()) {
+    for (const Node &entry : module.forest[1].list()) {
+      if (!entry.is_list() || entry.list().size() < 3 || !entry.list()[0].is_str())
+        continue;
+      const List &e = entry.list();
+      for (std::size_t i = 2; i < e.size(); ++i)
+        if (e[i].is_int())
+          add("operator(." + lower_copy(e[0].str()) + ".)",
+              static_cast<int>(e[i].integer()));
     }
   }
   return out;
